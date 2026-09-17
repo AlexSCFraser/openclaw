@@ -1,4 +1,4 @@
-import { Method } from "matrix-js-sdk/lib/http-api/index.js";
+import { ConnectionError, HTTPError, Method } from "matrix-js-sdk/lib/http-api/index.js";
 import {
   EventType,
   MatrixError,
@@ -28,13 +28,33 @@ export async function reconcileJoinedRoomEncryption(
     assertCurrent();
   };
   checkActive();
-  const { joined_rooms: joinedRooms } = await client.http.authedRequest<{ joined_rooms: string[] }>(
-    Method.Get,
-    "/joined_rooms",
-    undefined,
-    undefined,
-    { abortSignal: signal },
-  );
+  let joinedRooms: string[];
+  try {
+    ({ joined_rooms: joinedRooms } = await client.http.authedRequest<{ joined_rooms: string[] }>(
+      Method.Get,
+      "/joined_rooms",
+      undefined,
+      undefined,
+      { abortSignal: signal },
+    ));
+  } catch (error) {
+    checkActive();
+    if (
+      error instanceof ConnectionError ||
+      (error instanceof HTTPError &&
+        (error.httpStatus === 408 || error.httpStatus === 429 || (error.httpStatus ?? 0) >= 500))
+    ) {
+      // Discovery is best effort: healthy cached rooms can still send, while
+      // the send owner continues to reject unknown or unrecovered encryption.
+      LogService.warn(
+        "MatrixClientLite",
+        "Skipping room encryption recovery: joined-room discovery failed",
+        error,
+      );
+      return;
+    }
+    throw error;
+  }
   checkActive();
   if (!Array.isArray(joinedRooms) || !joinedRooms.every((room) => typeof room === "string")) {
     throw new Error("Matrix homeserver returned invalid joined rooms");
