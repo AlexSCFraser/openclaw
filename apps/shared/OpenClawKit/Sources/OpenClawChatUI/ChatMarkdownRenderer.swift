@@ -14,40 +14,6 @@ func chatMarkdownDisclosureSummarySource(
     authoredSummary ?? localizedDefault()
 }
 
-/// Shared native Markdown rendering for app-owned chat surfaces outside the
-/// full OpenClaw chat transcript.
-@MainActor
-public struct OpenClawChatMarkdownView: View {
-    private let text: String
-    private let isUserMessage: Bool
-    private let variant: ChatMarkdownVariant
-    private let textColor: Color
-    private let isComplete: Bool
-
-    public init(
-        text: String,
-        isUserMessage: Bool,
-        variant: ChatMarkdownVariant = .standard,
-        textColor: Color,
-        isComplete: Bool = true)
-    {
-        self.text = text
-        self.isUserMessage = isUserMessage
-        self.variant = variant
-        self.textColor = textColor
-        self.isComplete = isComplete
-    }
-
-    public var body: some View {
-        ChatMarkdownRenderer(
-            text: self.text,
-            context: self.isUserMessage ? .user : .assistant,
-            variant: self.variant,
-            textColor: self.textColor,
-            isComplete: self.isComplete)
-    }
-}
-
 @MainActor
 struct ChatMarkdownRenderer: View {
     enum Context {
@@ -287,10 +253,12 @@ struct ChatMarkdownRenderSnapshot {
                     preparesReveal: false),
                 isExpanded: disclosure.isExpanded,
                 blocks: disclosure.blocks.map {
+                    // Reveal locations address only top-level blocks. Disclosure content
+                    // uses a nested renderer without reveal state, so render it directly.
                     Self.renderedBlock(
                         $0,
                         isComplete: isComplete,
-                        preparesReveal: preparesReveal)
+                        preparesReveal: false)
                 }))
         case .thematicBreak:
             .thematicBreak

@@ -1,12 +1,11 @@
 import { html, nothing } from "lit";
 import type { DoctorMemoryStatusPayload } from "../../../../src/gateway/server-methods/doctor.ts";
-import type { AgentSelectOption } from "../../components/agent-select.ts";
+import { lobsterPetSeed } from "../../components/lobster-pet-contract.ts";
 import {
   createLobsterPetLook,
   lobsterLookStyle,
-  lobsterPetSeed,
   renderLobsterSvg,
-} from "../../components/lobster-pet.ts";
+} from "../../components/lobster-pet-look.ts";
 import {
   renderSettingsNavRow,
   renderSettingsRow,
@@ -15,11 +14,13 @@ import {
   renderSettingsValue,
 } from "../../components/settings-ui.ts";
 import { t } from "../../i18n/index.ts";
+import { registerSettingsEnglish } from "../../i18n/locales/en-settings.ts";
 import { formatRelativeTimestamp } from "../../lib/format.ts";
 import "../../styles/memory-overview.css";
 import type { MemoryEngineSelection } from "./memory-schema.ts";
 import { selectedEngineId } from "./memory-schema.ts";
-import { renderMemoryAgentScope } from "./memory.ts";
+
+registerSettingsEnglish();
 
 export type MemoryOverviewStatus =
   | { kind: "idle" | "loading" }
@@ -28,12 +29,12 @@ export type MemoryOverviewStatus =
 
 type MemoryOverviewProps = {
   agentId: string | null;
-  agents: readonly AgentSelectOption[];
   engineSelection: MemoryEngineSelection;
   engineDisabled: boolean;
   status: MemoryOverviewStatus;
-  onAgentChange: (agentId: string | null) => void;
+  probingEmbeddings: boolean;
   onRefresh: () => void;
+  onProbeEmbeddings: () => void;
   onNavigate: (tab: "memories" | "dreams" | "settings") => void;
 };
 
@@ -103,15 +104,19 @@ function renderHero(props: MemoryOverviewProps) {
         <h2>${headline}</h2>
         <p class=${error ? "memory-overview__hero-error" : ""}>${description}</p>
         <div class="memory-overview__hero-actions">
-          ${off
-            ? html`<button class="btn btn--sm" @click=${() => props.onNavigate("settings")}>
-                ${t("memoryPage.overview.hero.openSettings")}
-              </button>`
-            : html`<button class="btn btn--sm" @click=${props.onRefresh}>
-                ${props.status.kind === "error"
-                  ? t("memoryPage.overview.hero.retry")
-                  : t("memoryPage.overview.hero.refresh")}
-              </button>`}
+          ${
+            off
+              ? html`<button class="btn btn--sm" @click=${() => props.onNavigate("settings")}>
+                  ${t("memoryPage.overview.hero.openSettings")}
+                </button>`
+              : html`<button class="btn btn--sm" @click=${props.onRefresh}>
+                  ${
+                    props.status.kind === "error"
+                      ? t("memoryPage.overview.hero.retry")
+                      : t("memoryPage.overview.hero.refresh")
+                  }
+                </button>`
+          }
         </div>
       </div>
     </section>
@@ -143,30 +148,45 @@ function phaseScheduleDescription(
 function renderSchedule(dreaming: DreamingStatus) {
   const phases = [
     ["light", dreaming.phases.light],
-    ["deep", dreaming.phases.deep],
     ["rem", dreaming.phases.rem],
+    ["deep", dreaming.phases.deep],
   ] as const;
   return renderSettingsSection(
     { title: t("memoryPage.overview.schedule.title") },
-    phases.map(([name, phase]) =>
-      renderSettingsRow({
-        title: t(`memoryPage.dreaming.phases.${name}.title`),
-        description: phaseScheduleDescription(
-          phase,
-          dreaming.timezone,
-          dreaming.enabled && phase.enabled && phase.managedCronPresent,
-        ),
-        control: renderSettingsStatus({
-          kind: dreaming.enabled && phase.enabled && phase.managedCronPresent ? "ok" : "muted",
-          label:
-            !dreaming.enabled || !phase.enabled
-              ? t("common.disabled")
-              : phase.managedCronPresent
-                ? t("common.enabled")
-                : t("memoryPage.overview.schedule.notScheduled"),
+    html`
+      ${phases.map(([name, phase]) =>
+        renderSettingsRow({
+          title: t(`memoryPage.dreaming.phases.${name}.title`),
+          description: html`
+            ${t(`memoryPage.overview.schedule.${name}Description`)}<br />
+            ${phaseScheduleDescription(
+              phase,
+              dreaming.timezone,
+              dreaming.enabled && phase.enabled && phase.managedCronPresent,
+            )}
+          `,
+          control: renderSettingsStatus({
+            kind: dreaming.enabled && phase.enabled && phase.managedCronPresent ? "ok" : "muted",
+            label:
+              !dreaming.enabled || !phase.enabled
+                ? t("common.disabled")
+                : phase.managedCronPresent
+                  ? t("common.enabled")
+                  : t("memoryPage.overview.schedule.notScheduled"),
+          }),
         }),
-      }),
-    ),
+      )}
+      ${renderSettingsRow({
+        title: t("memoryPage.overview.schedule.learnMore"),
+        control: html`<a
+          class="memory-page__link"
+          href="https://docs.openclaw.ai/concepts/dreaming"
+          target="_blank"
+          rel="noreferrer noopener"
+          >${t("memoryPage.overview.schedule.openDocs")}</a
+        >`,
+      })}
+    `,
   );
 }
 
@@ -190,17 +210,16 @@ function renderActivity(dreaming: DreamingStatus) {
   );
 }
 
-function renderEngineHealth(payload: DoctorMemoryStatusPayload) {
-  const embeddingKind = payload.embedding.ok
-    ? "ok"
-    : payload.embedding.checked === false
-      ? "muted"
-      : "danger";
-  const embeddingLabel = payload.embedding.ok
-    ? t("memoryPage.overview.health.healthy")
-    : payload.embedding.checked === false
-      ? t("memoryPage.overview.health.notChecked")
-      : t("memoryPage.overview.health.unavailable");
+function renderEngineHealth(payload: DoctorMemoryStatusPayload, props: MemoryOverviewProps) {
+  const notChecked = payload.embedding.checked === false;
+  const embeddingKind = payload.embedding.ok ? "ok" : notChecked ? "muted" : "danger";
+  const embeddingLabel = props.probingEmbeddings
+    ? t("memoryPage.overview.health.checking")
+    : payload.embedding.ok
+      ? t("memoryPage.overview.health.healthy")
+      : notChecked
+        ? t("memoryPage.overview.health.notChecked")
+        : t("memoryPage.overview.health.unavailable");
   return renderSettingsSection(
     { title: t("memoryPage.overview.health.title") },
     html`
@@ -210,36 +229,66 @@ function renderEngineHealth(payload: DoctorMemoryStatusPayload) {
       })}
       ${renderSettingsRow({
         title: t("memoryPage.overview.health.embeddings"),
-        description: payload.embedding.ok ? nothing : payload.embedding.error,
-        control: renderSettingsStatus({ kind: embeddingKind, label: embeddingLabel }),
+        description: payload.embedding.ok
+          ? nothing
+          : notChecked
+            ? t("memoryPage.overview.health.notCheckedDescription")
+            : payload.embedding.error,
+        control: html`
+          ${renderSettingsStatus({ kind: embeddingKind, label: embeddingLabel })}
+          ${
+            notChecked
+              ? html`<button
+                  type="button"
+                  class="btn btn--sm"
+                  ?disabled=${props.probingEmbeddings}
+                  @click=${props.onProbeEmbeddings}
+                >
+                  ${
+                    props.probingEmbeddings
+                      ? t("memoryPage.overview.health.testing")
+                      : t("memoryPage.overview.health.test")
+                  }
+                </button>`
+              : nothing
+          }
+        `,
       })}
-      ${payload.embeddingRuntime
-        ? renderSettingsRow({
-            title: t("memoryPage.overview.health.runtime"),
-            description: payload.embeddingRuntime.loadError,
-            control: renderSettingsValue(
-              [
-                payload.embeddingRuntime.engine,
-                payload.embeddingRuntime.backend,
-                payload.embeddingRuntime.deviceNames?.join(", "),
-              ]
-                .filter(Boolean)
-                .join(" · "),
-            ),
-          })
-        : nothing}
+      ${
+        payload.embeddingRuntime
+          ? renderSettingsRow({
+              title: t("memoryPage.overview.health.runtime"),
+              description: payload.embeddingRuntime.loadError,
+              control: renderSettingsValue(
+                [
+                  payload.embeddingRuntime.engine,
+                  payload.embeddingRuntime.backend,
+                  payload.embeddingRuntime.buildInfo,
+                  payload.embeddingRuntime.model?.id,
+                  payload.embeddingRuntime.endpoints
+                    ? Object.entries(payload.embeddingRuntime.endpoints)
+                        .map(([name, state]) => `${name}=${state}`)
+                        .join(" ")
+                    : undefined,
+                ]
+                  .filter(Boolean)
+                  .join(" · "),
+              ),
+            })
+          : nothing
+      }
     `,
   );
 }
 
-function renderStatusCards(status: MemoryOverviewStatus) {
-  if (status.kind !== "ready") {
+function renderStatusCards(props: MemoryOverviewProps) {
+  if (props.status.kind !== "ready") {
     return nothing;
   }
   return html`
-    ${status.payload.dreaming ? renderSchedule(status.payload.dreaming) : nothing}
-    ${status.payload.dreaming ? renderActivity(status.payload.dreaming) : nothing}
-    ${renderEngineHealth(status.payload)}
+    ${props.status.payload.dreaming ? renderSchedule(props.status.payload.dreaming) : nothing}
+    ${props.status.payload.dreaming ? renderActivity(props.status.payload.dreaming) : nothing}
+    ${renderEngineHealth(props.status.payload, props)}
   `;
 }
 
@@ -267,13 +316,7 @@ export function renderMemoryOverview(props: MemoryOverviewProps) {
   const active = props.engineSelection.kind !== "off" && !props.engineDisabled;
   return html`
     <div class="settings-page memory-overview">
-      ${renderHero(props)}
-      ${renderMemoryAgentScope({
-        agentId: props.agentId,
-        agents: props.agents,
-        onAgentChange: props.onAgentChange,
-      })}
-      ${active ? renderStatusCards(props.status) : nothing} ${renderShortcuts(props)}
+      ${renderHero(props)} ${active ? renderStatusCards(props) : nothing} ${renderShortcuts(props)}
     </div>
   `;
 }

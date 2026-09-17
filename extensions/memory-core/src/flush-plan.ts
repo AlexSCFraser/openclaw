@@ -1,18 +1,13 @@
 // Memory Core plugin module implements flush plan behavior.
-import { createHash } from "node:crypto";
 import {
   DEFAULT_AGENT_COMPACTION_RESERVE_TOKENS_FLOOR,
   parseNonNegativeByteSize,
   resolveCronStyleNow,
+  resolveEffectiveCompactionReserveTokens,
   SILENT_REPLY_TOKEN,
   type MemoryFlushPlan,
   type OpenClawConfig,
 } from "openclaw/plugin-sdk/memory-core-host-runtime-core";
-import {
-  DREAMING_DAILY_PROVENANCE_NAMESPACE,
-  readMemoryCoreWorkspaceEntries,
-  writeMemoryCoreWorkspaceEntry,
-} from "./dreaming-state.js";
 import { resolveMemoryCoreNowMs } from "./time.js";
 
 const DEFAULT_MEMORY_FLUSH_SOFT_TOKENS = 4000;
@@ -104,6 +99,7 @@ export function buildMemoryFlushPlan(
   params: {
     cfg?: OpenClawConfig;
     nowMs?: number;
+    contextWindowTokens?: number;
   } = {},
 ): MemoryFlushPlan | null {
   const resolved = params;
@@ -114,12 +110,23 @@ export function buildMemoryFlushPlan(
     return null;
   }
 
-  const softThresholdTokens =
+  let softThresholdTokens =
     normalizeNonNegativeInt(defaults?.softThresholdTokens) ?? DEFAULT_MEMORY_FLUSH_SOFT_TOKENS;
   const forceFlushTranscriptBytes =
     parseNonNegativeByteSize(defaults?.forceFlushTranscriptBytes) ??
     DEFAULT_MEMORY_FLUSH_FORCE_TRANSCRIPT_BYTES;
-  const reserveTokensFloor = DEFAULT_AGENT_COMPACTION_RESERVE_TOKENS_FLOOR;
+  let reserveTokensFloor = DEFAULT_AGENT_COMPACTION_RESERVE_TOKENS_FLOOR;
+  const contextWindowTokens = normalizeNonNegativeInt(params.contextWindowTokens);
+  if (contextWindowTokens !== null && contextWindowTokens > 0) {
+    reserveTokensFloor = resolveEffectiveCompactionReserveTokens({
+      contextTokenBudget: contextWindowTokens,
+      reserveTokens: reserveTokensFloor,
+    });
+    softThresholdTokens = Math.min(
+      softThresholdTokens,
+      Math.floor((contextWindowTokens - reserveTokensFloor) / 2),
+    );
+  }
 
   const { timeLine, userTimezone } = resolveCronStyleNow(cfg ?? {}, nowMs);
   const dateStamp = formatDateStampInTimezone(nowMs, userTimezone);
@@ -138,30 +145,5 @@ export function buildMemoryFlushPlan(
     prompt: appendCurrentTimeLine(promptBase.replaceAll("YYYY-MM-DD", dateStamp), timeLine),
     systemPrompt: systemPrompt.replaceAll("YYYY-MM-DD", dateStamp),
     relativePath,
-    recordWriteProvenance: async (write) => {
-      const hash = (value: string) => createHash("sha256").update(value).digest("hex");
-      const existing = (
-        await readMemoryCoreWorkspaceEntries<{
-          fileHash: string;
-          originClass: "agent" | "untrusted";
-          observedAt: number;
-        }>({ namespace: DREAMING_DAILY_PROVENANCE_NAMESPACE, workspaceDir: write.workspaceDir })
-      ).find((entry) => entry.key === write.relativePath)?.value;
-      const originClass =
-        write.originClass === "agent" &&
-        (!write.contentBefore ||
-          (existing?.originClass === "agent" && existing.fileHash === hash(write.contentBefore)))
-          ? "agent"
-          : "untrusted";
-      // Provenance is file-level and therefore collapses to the least-trusted
-      // content in the file. Trusted lines in a downgraded file lose promotion
-      // eligibility; untrusted content must never ride an agent-trusted hash.
-      await writeMemoryCoreWorkspaceEntry({
-        namespace: DREAMING_DAILY_PROVENANCE_NAMESPACE,
-        workspaceDir: write.workspaceDir,
-        key: write.relativePath,
-        value: { fileHash: hash(write.contentAfter), originClass, observedAt: write.observedAt },
-      });
-    },
   };
 }

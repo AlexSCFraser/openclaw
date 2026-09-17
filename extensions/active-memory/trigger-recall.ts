@@ -1,5 +1,9 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
-import type { MemorySearchResult } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+import {
+  isAutomaticMemoryEntryEligible,
+  stripMemoryAnnotationCarriers,
+  type MemorySearchResult,
+} from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import { getActiveMemorySearchManager } from "openclaw/plugin-sdk/memory-host-search";
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { buildPromptPrefix } from "./prompt.js";
@@ -53,7 +57,7 @@ function scoreTriggerPhrase(message: string, phrase: string): number {
 }
 
 export function isPromotedTrustedMemoryEntry(
-  entry: Pick<MemorySearchResult, "path" | "source" | "originClass" | "projectKey">,
+  entry: Pick<MemorySearchResult, "provenance" | "projectKey" | "source">,
   activeProjectKeys: readonly string[] = [],
 ): boolean {
   if (entry.projectKey) {
@@ -74,14 +78,7 @@ export function isPromotedTrustedMemoryEntry(
       return false;
     }
   }
-  if (entry.originClass === "owner" || entry.originClass === "agent") {
-    return true;
-  }
-  if (entry.source !== "memory") {
-    return false;
-  }
-  const normalized = entry.path.replaceAll("\\", "/").replace(/^\.\//u, "").toUpperCase();
-  return normalized === "MEMORY.MD" || normalized === "USER.MD";
+  return entry.source === "memory" && isAutomaticMemoryEntryEligible(entry);
 }
 
 export function scoreTriggerMatch(message: string, entry: MemorySearchResult): number {
@@ -119,19 +116,37 @@ export function buildTriggerRecallContext(matches: TriggerRecallMatch[]): string
     return undefined;
   }
   const summary = matches
-    .map((entry) => `- ${entry.snippet.trim()} (Source: ${entry.path}#L${String(entry.startLine)})`)
+    .map(
+      (entry) =>
+        `- ${stripMemoryAnnotationCarriers(entry.snippet).trim()} (Source: ${entry.path}#L${String(entry.startLine)})`,
+    )
     .join("\n");
   return buildPromptPrefix(truncateUtf16Safe(summary, MAX_TRIGGER_CONTEXT_CHARS));
 }
 
-export async function resolveTriggerRecall(params: {
+type TriggerLookupParams = {
   cfg: OpenClawConfig;
   agentId: string;
   query: string;
-  message: string;
   activeProjectKeys?: string[];
   signal?: AbortSignal;
-}): Promise<{ context?: string; hasStrongHit: boolean; injectedCount: number }> {
+  runId?: string;
+  /** Undefined uses legacy query identity; null disables request-local reuse. */
+  requestKey?: string | null;
+  authorityFingerprint?: string;
+};
+
+type TriggerRecallRunEntry = {
+  activeProjectKeys: string[];
+  agentId: string;
+  cfg: OpenClawConfig;
+  promise: Promise<MemorySearchResult[]>;
+  query: string;
+};
+
+const triggerRecallRuns = new Map<string, TriggerRecallRunEntry>();
+
+async function loadTriggerRecallCandidates(params: TriggerLookupParams) {
   params.signal?.throwIfAborted();
   const activeProjectKeys = params.activeProjectKeys ?? [];
   const lookup = await waitForTriggerLookup(
@@ -142,7 +157,7 @@ export async function resolveTriggerRecall(params: {
     params.signal,
   );
   if (!lookup.manager?.listTriggerCandidates) {
-    return { hasStrongHit: false, injectedCount: 0 };
+    return [];
   }
   const lookupWork = Promise.all([
     lookup.manager
@@ -154,7 +169,6 @@ export async function resolveTriggerRecall(params: {
         // Lane-1 runs on every eligible inbound message; it must stay
         // deterministic and local, so query embedding is disabled.
         lexicalOnly: true,
-        qmdSearchModeOverride: "search",
         activeProjectKeys: [...activeProjectKeys],
       })
       .catch(() => []),
@@ -163,7 +177,7 @@ export async function resolveTriggerRecall(params: {
       .catch(() => []),
   ]);
   const [retrieved, triggerCandidates] = await waitForTriggerLookup(lookupWork, params.signal);
-  const candidates = [
+  return [
     ...new Map(
       [...triggerCandidates, ...retrieved].map((entry) => [
         `${entry.source}:${entry.path}:${String(entry.startLine)}:${String(entry.endLine)}`,
@@ -171,6 +185,51 @@ export async function resolveTriggerRecall(params: {
       ]),
     ).values(),
   ];
+}
+
+function resolveTriggerRecallCandidates(params: TriggerLookupParams) {
+  const runId = params.runId?.trim();
+  if (!runId || params.requestKey === null) {
+    return loadTriggerRecallCandidates(params);
+  }
+  const runKey = `${runId}:${JSON.stringify([params.authorityFingerprint, params.requestKey])}`;
+  const existing = triggerRecallRuns.get(runKey);
+  const activeProjectKeys = params.activeProjectKeys ?? [];
+  if (
+    existing &&
+    existing.cfg === params.cfg &&
+    existing.agentId === params.agentId &&
+    (params.requestKey !== undefined || existing.query === params.query) &&
+    existing.activeProjectKeys.length === activeProjectKeys.length &&
+    existing.activeProjectKeys.every((key, index) => key === activeProjectKeys[index])
+  ) {
+    return existing.promise;
+  }
+  const entry: TriggerRecallRunEntry = {
+    activeProjectKeys: [...activeProjectKeys],
+    agentId: params.agentId,
+    cfg: params.cfg,
+    promise: loadTriggerRecallCandidates(params),
+    query: params.query,
+  };
+  triggerRecallRuns.set(runKey, entry);
+  void entry.promise.catch(() => {
+    if (triggerRecallRuns.get(runKey) === entry) {
+      triggerRecallRuns.delete(runKey);
+    }
+  });
+  return entry.promise;
+}
+
+export async function resolveTriggerRecall(
+  params: TriggerLookupParams & { message: string },
+): Promise<{ context?: string; hasStrongHit: boolean; injectedCount: number }> {
+  params.signal?.throwIfAborted();
+  const activeProjectKeys = params.activeProjectKeys ?? [];
+  const candidates = await waitForTriggerLookup(
+    resolveTriggerRecallCandidates(params),
+    params.signal,
+  );
   const matches = selectStrongTriggerMatches(params.message, candidates, activeProjectKeys);
   const context = buildTriggerRecallContext(matches);
   return {
@@ -178,6 +237,20 @@ export async function resolveTriggerRecall(params: {
     hasStrongHit: matches.length > 0,
     injectedCount: matches.length,
   };
+}
+
+export function forgetTriggerRecallRun(runId: string | undefined): void {
+  if (runId) {
+    for (const key of triggerRecallRuns.keys()) {
+      if (key.startsWith(`${runId}:`)) {
+        triggerRecallRuns.delete(key);
+      }
+    }
+  }
+}
+
+export function resetTriggerRecallRunsForTests(): void {
+  triggerRecallRuns.clear();
 }
 
 function waitForTriggerLookup<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -206,4 +279,4 @@ function waitForTriggerLookup<T>(work: Promise<T>, signal?: AbortSignal): Promis
   });
 }
 
-export { MAX_TRIGGER_CONTEXT_CHARS, STRONG_TRIGGER_MATCH_SCORE };
+export { MAX_TRIGGER_CONTEXT_CHARS };

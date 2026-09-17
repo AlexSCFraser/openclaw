@@ -1,19 +1,26 @@
 // Proves local Ollama inference crosses a real Gateway and paired node socket.
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { once } from "node:events";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 import { GatewayClient } from "openclaw/plugin-sdk/gateway-runtime";
 import type { OpenClawPluginNodeHostCommand } from "openclaw/plugin-sdk/plugin-entry";
+import { stopChildProcess } from "openclaw/plugin-sdk/test-env";
 import { createOpenClawTestState } from "openclaw/plugin-sdk/test-state";
 import { describe, expect, it, vi } from "vitest";
 import { createOllamaNodeHostCommands } from "./node-inference.js";
 
 const E2E_TIMEOUT_MS = 90_000;
-const STARTUP_TIMEOUT_MS = 25_000;
+// Match the shared Gateway fixture and reserve separate bounded post-start phases.
+const STARTUP_TIMEOUT_MS = Math.floor((E2E_TIMEOUT_MS * 2) / 3);
+const CLEANUP_RESERVE_MS = 10_000;
+const INFERENCE_TIMEOUT_MS = 10_000;
+const CONNECT_ATTEMPT_TIMEOUT_MS = 5_000;
+const GATEWAY_READINESS_TIMEOUT_MS =
+  E2E_TIMEOUT_MS - STARTUP_TIMEOUT_MS - INFERENCE_TIMEOUT_MS - CLEANUP_RESERVE_MS;
 const NODE_DISPLAY_NAME = "paired-ollama-e2e";
 const NODE_MODEL = "node-local:latest";
 const LOADED_NODE_MODEL = "loaded-node-local:latest";
@@ -76,12 +83,14 @@ describe("Ollama paired-node Gateway inference", () => {
           },
         });
 
+        const gatewayEntryArgs =
+          process.env.OPENCLAW_E2E_USE_PREBUILT_DIST === "1"
+            ? ["dist/entry.js"]
+            : ["--import", "tsx", "src/entry.ts"];
         gateway = spawn(
           process.execPath,
           [
-            "--import",
-            "tsx",
-            "src/entry.ts",
+            ...gatewayEntryArgs,
             "gateway",
             "--port",
             String(gatewayPort),
@@ -120,6 +129,7 @@ describe("Ollama paired-node Gateway inference", () => {
         gateway.once("error", (error) => appendGatewayLog(gatewayLogs, error.message));
 
         await waitForGatewayHealth(gateway, gatewayPort, gatewayLogs);
+        const readinessDeadline = performance.now() + GATEWAY_READINESS_TIMEOUT_MS;
 
         try {
           operator = await vi.waitFor(
@@ -127,12 +137,16 @@ describe("Ollama paired-node Gateway inference", () => {
               connectClient({
                 gatewayPort,
                 gatewayToken,
+                readinessDeadline,
                 role: "operator",
                 clientName: "test",
                 mode: "test",
                 scopes: ["operator.admin", "operator.pairing", "operator.read", "operator.write"],
               }),
-            { timeout: 15_000, interval: 250 },
+            {
+              timeout: remainingPhaseTimeoutMs(readinessDeadline, "Gateway readiness"),
+              interval: 250,
+            },
           );
         } catch (error) {
           throw new Error(
@@ -148,6 +162,7 @@ describe("Ollama paired-node Gateway inference", () => {
         node = await connectPairedNode(operator, {
           gatewayPort,
           gatewayToken,
+          readinessDeadline,
           role: "node",
           clientName: "node-host",
           mode: "node",
@@ -167,25 +182,36 @@ describe("Ollama paired-node Gateway inference", () => {
           },
         });
 
-        const pairedNode = await waitForPairedInferenceNode(operator, gatewayLogs);
+        const pairedNode = await waitForPairedInferenceNode(
+          operator,
+          gatewayLogs,
+          readinessDeadline,
+        );
         expect(pairedNode.commands).toEqual(
           expect.arrayContaining(["ollama.models", "ollama.chat"]),
         );
 
+        const inferenceDeadline = performance.now() + INFERENCE_TIMEOUT_MS;
         const rejected = await invokeGatewayTool({
           port: gatewayPort,
           token: "not-the-gateway-token",
           args: { action: "discover" },
+          timeoutMs: remainingPhaseTimeoutMs(inferenceDeadline, "Ollama inference"),
         });
         expect(rejected.status).toBe(401);
 
-        const discovered = await operator.request("node.invoke", {
-          nodeId: pairedNode.nodeId,
-          command: "ollama.models",
-          params: {},
-          timeoutMs: 15_000,
-          idempotencyKey: randomUUID(),
-        });
+        const discoveryTimeoutMs = remainingPhaseTimeoutMs(inferenceDeadline, "Ollama discovery");
+        const discovered = await operator.request(
+          "node.invoke",
+          {
+            nodeId: pairedNode.nodeId,
+            command: "ollama.models",
+            params: {},
+            timeoutMs: discoveryTimeoutMs,
+            idempotencyKey: randomUUID(),
+          },
+          { timeoutMs: discoveryTimeoutMs },
+        );
         expect(discovered).toMatchObject({
           ok: true,
           nodeId: pairedNode.nodeId,
@@ -199,18 +225,23 @@ describe("Ollama paired-node Gateway inference", () => {
           },
         });
 
-        const chat = await operator.request("node.invoke", {
-          nodeId: pairedNode.nodeId,
-          command: "ollama.chat",
-          params: {
-            model: NODE_MODEL,
-            prompt: "Reply exactly with PAIRED_NODE_OK",
-            maxTokens: 16,
-            timeoutMs: 10_000,
+        const chatTimeoutMs = remainingPhaseTimeoutMs(inferenceDeadline, "Ollama chat");
+        const chat = await operator.request(
+          "node.invoke",
+          {
+            nodeId: pairedNode.nodeId,
+            command: "ollama.chat",
+            params: {
+              model: NODE_MODEL,
+              prompt: "Reply exactly with PAIRED_NODE_OK",
+              maxTokens: 16,
+              timeoutMs: chatTimeoutMs,
+            },
+            timeoutMs: chatTimeoutMs,
+            idempotencyKey: randomUUID(),
           },
-          timeoutMs: 15_000,
-          idempotencyKey: randomUUID(),
-        });
+          { timeoutMs: chatTimeoutMs },
+        );
         expect(chat).toMatchObject({
           ok: true,
           nodeId: pairedNode.nodeId,
@@ -241,10 +272,18 @@ describe("Ollama paired-node Gateway inference", () => {
           ...(node ? [node.stopAndWait({ timeoutMs: 1000 })] : []),
           ...(operator ? [operator.stopAndWait({ timeoutMs: 1000 })] : []),
         ]);
-        if (gateway) {
-          await stopGatewayProcess(gateway);
+        try {
+          if (gateway) {
+            await stopChildProcess(gateway, 2_000).catch(async (error: unknown) => {
+              // The child keeps its copied env and retained files; join the parent's
+              // state work before restoring selectors for the next fixture.
+              await state.restoreEnv();
+              throw error;
+            });
+          }
+        } finally {
+          await Promise.allSettled([nodeOllama.close(), gatewayOllama.close()]);
         }
-        await Promise.allSettled([nodeOllama.close(), gatewayOllama.close()]);
         await state.cleanup();
       }
     },
@@ -299,9 +338,18 @@ async function waitForGatewayHealth(
   throw new Error(`Gateway did not become healthy:\n${logs.join("")}`, { cause: lastError });
 }
 
+function remainingPhaseTimeoutMs(deadline: number, phase: string): number {
+  const remainingMs = Math.ceil(deadline - performance.now());
+  if (remainingMs <= 0) {
+    throw new Error(`${phase} exceeded its bounded E2E phase`);
+  }
+  return remainingMs;
+}
+
 async function connectClient(params: {
   gatewayPort: number;
   gatewayToken: string;
+  readinessDeadline: number;
   role: "operator" | "node";
   clientName: "test" | "node-host";
   mode: "test" | "node";
@@ -312,6 +360,11 @@ async function connectClient(params: {
   commands?: string[];
   onEvent?: (event: { event: string; payload?: unknown }) => void;
 }): Promise<GatewayClient> {
+  // Leave the shared readiness deadline available for another handshake attempt.
+  const timeoutMs = Math.min(
+    CONNECT_ATTEMPT_TIMEOUT_MS,
+    remainingPhaseTimeoutMs(params.readinessDeadline, "Gateway client readiness"),
+  );
   return await new Promise<GatewayClient>((resolve, reject) => {
     let settled = false;
     const finish = (error?: Error) => {
@@ -339,7 +392,7 @@ async function connectClient(params: {
       scopes: params.scopes ?? [],
       caps: params.caps,
       commands: params.commands,
-      requestTimeoutMs: 15_000,
+      requestTimeoutMs: INFERENCE_TIMEOUT_MS,
       onEvent: params.onEvent,
       onHelloOk: () => finish(),
       onConnectError: (error) => finish(error),
@@ -347,29 +400,43 @@ async function connectClient(params: {
     });
     const timeout = setTimeout(
       () => finish(new Error("Gateway client connection timed out")),
-      5_000,
+      timeoutMs,
     );
     timeout.unref();
     client.start();
   });
 }
 
-async function approvePendingNodePairings(operator: GatewayClient): Promise<void> {
+async function approvePendingNodePairings(
+  operator: GatewayClient,
+  readinessDeadline: number,
+): Promise<void> {
+  const pairingOptions = () => ({
+    timeoutMs: remainingPhaseTimeoutMs(readinessDeadline, "Gateway node pairing"),
+  });
   const devices = await operator.request<{
     pending?: Array<{ requestId?: string; role?: string }>;
-  }>("device.pair.list", {});
+  }>("device.pair.list", {}, pairingOptions());
   for (const request of devices.pending ?? []) {
     if (request.requestId) {
-      await operator.request("device.pair.approve", { requestId: request.requestId });
+      await operator.request(
+        "device.pair.approve",
+        { requestId: request.requestId },
+        pairingOptions(),
+      );
     }
   }
 
   const nodes = await operator.request<{
     pending?: Array<{ requestId?: string; displayName?: string }>;
-  }>("node.pair.list", {});
+  }>("node.pair.list", {}, pairingOptions());
   for (const request of nodes.pending ?? []) {
     if (request.requestId) {
-      await operator.request("node.pair.approve", { requestId: request.requestId });
+      await operator.request(
+        "node.pair.approve",
+        { requestId: request.requestId },
+        pairingOptions(),
+      );
     }
   }
 }
@@ -387,18 +454,22 @@ async function connectPairedNode(
     }
     // The operator and node share this isolated device identity. Approving the
     // Gateway's requested role upgrade preserves the real node pairing boundary.
-    await approvePendingNodePairings(operator);
+    await approvePendingNodePairings(operator, params.readinessDeadline);
     return await connectClient(params);
   }
 }
 
-async function waitForPairedInferenceNode(operator: GatewayClient, logs: string[]) {
+async function waitForPairedInferenceNode(
+  operator: GatewayClient,
+  logs: string[],
+  readinessDeadline: number,
+) {
   let paired:
     | { nodeId: string; displayName?: string; connected?: boolean; commands?: string[] }
     | undefined;
   await vi.waitFor(
     async () => {
-      await approvePendingNodePairings(operator);
+      await approvePendingNodePairings(operator, readinessDeadline);
       const result = await operator.request<{
         nodes?: Array<{
           nodeId: string;
@@ -406,14 +477,23 @@ async function waitForPairedInferenceNode(operator: GatewayClient, logs: string[
           connected?: boolean;
           commands?: string[];
         }>;
-      }>("node.list", {});
+      }>(
+        "node.list",
+        {},
+        {
+          timeoutMs: remainingPhaseTimeoutMs(readinessDeadline, "Gateway node discovery"),
+        },
+      );
       paired = result.nodes?.find(
         (entry) => entry.displayName === NODE_DISPLAY_NAME && entry.connected,
       );
       expect(paired, logs.join("")).toBeDefined();
       expect(paired?.commands).toEqual(expect.arrayContaining(["ollama.models", "ollama.chat"]));
     },
-    { timeout: 25_000, interval: 100 },
+    {
+      timeout: remainingPhaseTimeoutMs(readinessDeadline, "Gateway node readiness"),
+      interval: 100,
+    },
   );
   if (!paired) {
     throw new Error("Ollama-capable paired node never connected");
@@ -458,6 +538,7 @@ async function invokeGatewayTool(params: {
   port: number;
   token: string;
   args: Record<string, unknown>;
+  timeoutMs: number;
 }): Promise<Response> {
   return await fetch(`http://127.0.0.1:${params.port}/tools/invoke`, {
     method: "POST",
@@ -466,7 +547,7 @@ async function invokeGatewayTool(params: {
       authorization: `Bearer ${params.token}`,
     },
     body: JSON.stringify({ tool: "node_inference", args: params.args }),
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(params.timeoutMs),
   });
 }
 
@@ -536,13 +617,7 @@ async function handleFakeOllamaRequest(
   }
   if (requestPath === "/api/show") {
     const body = await readRequestJson(request);
-    // Ollama documents `model`; the current provider sends its supported `name` alias.
-    const modelName =
-      typeof body.model === "string"
-        ? body.model
-        : typeof body.name === "string"
-          ? body.name
-          : undefined;
+    const modelName = typeof body.model === "string" ? body.model : undefined;
     if (!modelName) {
       response.statusCode = 400;
       response.end(JSON.stringify({ error: "model is required" }));
@@ -573,17 +648,4 @@ async function handleFakeOllamaRequest(
   }
   response.statusCode = 404;
   response.end(JSON.stringify({ error: "not found" }));
-}
-
-async function stopGatewayProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return;
-  }
-  const exited = once(child, "exit").then(() => true);
-  child.kill("SIGTERM");
-  if (await Promise.race([exited, delay(2_000).then(() => false)])) {
-    return;
-  }
-  child.kill("SIGKILL");
-  await Promise.race([exited, delay(2_000)]);
 }

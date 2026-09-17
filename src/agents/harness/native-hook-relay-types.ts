@@ -4,7 +4,21 @@ import type { PluginHookToolRequesterContext } from "../../plugins/hook-types.js
 import type {
   BeforeToolCallFailureDisposition,
   DeferredPluginToolApproval,
+  HookContext,
 } from "../agent-tools.before-tool-call.js";
+import type { CodexMcpServersConfig } from "../codex-mcp-config.types.js";
+import type { AgentHarnessHostCapabilities } from "./host-capability-types.js";
+import type { retainBeforeToolCallForNativeHookRelay } from "./host-private-capabilities.js";
+
+type NativeHookRelayApprovalContext = Pick<
+  HookContext,
+  | "approvalReviewerDeviceId"
+  | "trigger"
+  | "turnSourceAccountId"
+  | "turnSourceChannel"
+  | "turnSourceThreadId"
+  | "turnSourceTo"
+>;
 
 export type JsonValue =
   | null
@@ -64,12 +78,20 @@ export type NativeHookRelayRegistration = {
   sessionId: string;
   sessionKey?: string;
   config?: OpenClawConfig;
+  deferMcpToolApprovals?: boolean;
   runId: string;
   channelId?: string;
   requester?: PluginHookToolRequesterContext;
+  approvalContext?: NativeHookRelayApprovalContext;
   allowedEvents: readonly NativeHookRelayEvent[];
   expiresAtMs: number;
   signal?: AbortSignal;
+  /** Exact host policy capability for authority-bearing native callbacks. */
+  runBeforeToolCall?: AgentHarnessHostCapabilities["runBeforeToolCall"];
+  /** Foreground-only approval authority supplied by the admitted bundled host. */
+  approvalHost?: Pick<AgentHarnessHostCapabilities, "requestApproval" | "waitForApproval">;
+  /** Revalidates the exact admitted owner after authority-bearing awaits. */
+  assertActive?: AgentHarnessHostCapabilities["assertActive"];
   onPreToolUseFailure?: (failure: {
     toolName: string;
     toolCallId: string;
@@ -81,6 +103,7 @@ export type NativeHookRelayRegistration = {
 export type NativeHookRelayRegistrationHandle = NativeHookRelayRegistration & {
   generation?: string;
   shouldRelayEvent: (event: NativeHookRelayEvent) => boolean;
+  toolMatcherForEvent: (event: NativeHookRelayEvent) => readonly string[] | undefined;
   commandForEvent: (
     event: NativeHookRelayEvent,
     options?: NativeHookRelayCommandForEventOptions,
@@ -98,15 +121,20 @@ export type RegisterNativeHookRelayParams = {
   sessionId: string;
   sessionKey?: string;
   config?: OpenClawConfig;
+  autoApproveMcpTools?: boolean;
+  projectedMcpServers?: CodexMcpServersConfig;
   runId: string;
   channelId?: string;
   requester?: PluginHookToolRequesterContext;
+  approvalContext?: NativeHookRelayApprovalContext;
   allowedEvents?: readonly NativeHookRelayEvent[];
   /** Whether this relay should run OpenClaw loop detection from native PreToolUse hooks. */
   preToolUseLoopDetection?: boolean;
   ttlMs?: number;
   command?: NativeHookRelayCommandOptions;
   signal?: AbortSignal;
+  runBeforeToolCall?: NativeHookRelayRegistration["runBeforeToolCall"];
+  assertActive?: NativeHookRelayRegistration["assertActive"];
   onPreToolUseFailure?: NativeHookRelayRegistration["onPreToolUseFailure"];
 };
 
@@ -174,6 +202,7 @@ export type NativeHookRelayProviderAdapter = {
 export type NativeHookRelayPermissionApprovalResult =
   | NativeHookRelayPermissionDecision
   | "allow-always"
+  | "timed-out"
   | "defer";
 
 export type ActiveNativeHookRelayRegistration = NativeHookRelayRegistration & {
@@ -184,6 +213,15 @@ export type ActiveNativeHookRelayRegistration = NativeHookRelayRegistration & {
 
 export type ActiveNativeHookRelayRegistrationHandle = NativeHookRelayRegistrationHandle & {
   generation: string;
+};
+
+export type OwnedNativeHookRelayRegistrationHandle = ActiveNativeHookRelayRegistrationHandle & {
+  /** Strict policy preparation and direct publication result. */
+  ready: Promise<void>;
+  /** Requires current foreground authority; direct publication may use the Gateway fallback. */
+  prepareInvocation: () => Promise<void>;
+  /** Joins accepted policy, publication, renewal and cleanup without retiring retained children. */
+  drain: () => Promise<void>;
 };
 
 export type NativeHookRelayPermissionApprovalRequest = {
@@ -204,7 +242,16 @@ export type NativeHookRelayPermissionApprovalRequester = (
   request: NativeHookRelayPermissionApprovalRequest,
 ) => Promise<NativeHookRelayPermissionApprovalResult>;
 
+export type NativeHookRelayPendingPermissionApproval = {
+  relayId: string;
+  promise: Promise<NativeHookRelayPermissionApprovalResult>;
+  controller: AbortController;
+  waiters: number;
+  cancelWhenUnobserved: boolean;
+};
+
 export type NativeHookRelayPreToolUseApproval = {
+  relayId: string;
   deferredApproval: DeferredPluginToolApproval;
   originalParamsFingerprint: string;
   resolutionPromise?: Promise<NativeHookRelayDeferredApprovalOutcome>;
@@ -227,14 +274,41 @@ export type NativeHookRelayBridgeRegistration = {
   stateDbPath: string;
   token: string;
   server: Server;
+  ready: Promise<void>;
+  pending: Promise<void>;
+  cancelStartup: () => void;
+  closing?: Promise<void>;
 };
 
 export type NativeHookRelaySharedState = {
   relays: Map<string, ActiveNativeHookRelayRegistration>;
   relayBridges: Map<string, NativeHookRelayBridgeRegistration>;
+  pendingOperations: Set<Promise<unknown>>;
   invocations: NativeHookRelayInvocation[];
-  pendingPermissionApprovals: Map<string, Promise<NativeHookRelayPermissionApprovalResult>>;
+  pendingPermissionApprovals: Map<string, NativeHookRelayPendingPermissionApproval>;
   pendingPreToolUseApprovals: Map<string, NativeHookRelayPreToolUseApproval>;
   permissionApprovalWindows: Map<string, number[]>;
-  permissionAllowAlwaysApprovals: Map<string, { expiresAtMs: number }>;
+  permissionAllowAlwaysApprovals: Map<string, { relayId: string; expiresAtMs?: number }>;
+};
+
+/** Private bundled-runtime callbacks for retained direct-child hook policy. */
+export type NativeHookRelayRetention = Readonly<{
+  readClaim: (rawPayload: unknown) => string | undefined;
+  shouldRetainAfterForegroundClose: () => boolean;
+  allowPreToolUse: (claim: string) => boolean;
+  awaitForegroundAdmission?: (
+    claim: string,
+    signal?: AbortSignal,
+  ) => Promise<(() => boolean) | undefined>;
+  onDispose: () => void;
+}>;
+
+export type RelayLifetime = {
+  foregroundOpen: boolean;
+  foregroundToken: symbol;
+  policyReady: Promise<void>;
+  retained?: ReturnType<typeof retainBeforeToolCallForNativeHookRelay>;
+  retention?: NativeHookRelayRetention;
+  removeAbortListener?: () => void;
+  expiryTimer?: ReturnType<typeof setTimeout>;
 };

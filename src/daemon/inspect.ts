@@ -5,13 +5,17 @@ import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/st
 import {
   GATEWAY_SERVICE_KIND,
   GATEWAY_SERVICE_MARKER,
+  LEGACY_GATEWAY_SYSTEMD_SERVICE_NAMES,
   resolveGatewayLaunchAgentLabel,
   resolveGatewaySystemdServiceName,
   resolveGatewayWindowsTaskName,
 } from "./constants.js";
-import { resolveHomeDir } from "./paths.js";
+import { resolveLaunchAgentLabel } from "./launchd-label.js";
+import { parseLaunchdPlistLabel } from "./launchd-plist.js";
+import { readLaunchDaemonPlistLabel } from "./launchd-system.js";
+import { resolveDaemonHomeDir } from "./paths.js";
 import { execSchtasks } from "./schtasks-exec.js";
-import { parseSystemdExecStart } from "./systemd-unit.js";
+import { parseSystemdExecStart, splitSystemdLogicalLines } from "./systemd-unit.js";
 
 export type ExtraGatewayService = {
   platform: "darwin" | "linux" | "win32";
@@ -27,19 +31,6 @@ export type FindExtraGatewayServicesOptions = {
 };
 
 const EXTRA_MARKERS = ["openclaw", "clawdbot"] as const;
-const SYSTEMD_REFERENCE_ONLY_KEYS = new Set([
-  "after",
-  "before",
-  "bindsto",
-  "conflicts",
-  "partof",
-  "propagatesreloadto",
-  "reloadpropagatedfrom",
-  "requisite",
-  "requires",
-  "upholds",
-  "wants",
-]);
 
 function quotePosixCleanupArgument(value: string): string {
   return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
@@ -73,17 +64,10 @@ export function renderGatewayServiceCleanupHints(
         break;
       }
       case "linux": {
-        const systemctlCommand = service.scope === "user" ? "systemctl --user" : "sudo systemctl";
-        hints.push(
-          `${systemctlCommand} disable --now -- ${quotePosixCleanupArgument(service.label)}`,
-        );
-        if (service.detail.startsWith("unit:")) {
-          const unitPath = service.detail.slice("unit:".length).trim();
-          if (unitPath) {
-            const removeCommand = service.scope === "system" ? "sudo rm" : "rm";
-            hints.push(`${removeCommand} ${quotePosixCleanupArgument(unitPath)}`);
-          }
-        }
+        const systemctlCommand = `systemctl --${service.scope}`;
+        const unit = quotePosixCleanupArgument(service.label);
+        // A discovered unit may be the only running Gateway; inspect before removal.
+        hints.push(`${systemctlCommand} status -- ${unit}`, `${systemctlCommand} cat -- ${unit}`);
         break;
       }
       case "win32":
@@ -109,27 +93,20 @@ function hasGatewaySubcommandArg(args: string[]): boolean {
 }
 
 export function detectMarkerLineWithGateway(contents: string): Marker | null {
-  // Join line continuations before scanning systemd ExecStart commands; marker
-  // detection must ignore relationship-only unit keys.
-  const lower = normalizeLowercaseStringOrEmpty(contents.replace(/\\\r?\n\s*/g, " "));
-  for (const line of lower.split(/\r?\n/)) {
-    const trimmed = line.trim();
+  // Use the same physical-comment rules as service rewrites; comments must not
+  // hide a runnable extra service from diagnostics.
+  for (const line of splitSystemdLogicalLines(contents)) {
+    const trimmed = normalizeLowercaseStringOrEmpty(line);
     if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(";")) {
       continue;
     }
     const assignment = trimmed.indexOf("=");
     if (assignment > 0) {
       const key = trimmed.slice(0, assignment).trim();
-      if (SYSTEMD_REFERENCE_ONLY_KEYS.has(key)) {
-        continue;
-      }
       if (
-        key === "execstart" &&
+        key !== "execstart" ||
         !hasGatewaySubcommandArg(parseSystemdExecStart(trimmed.slice(assignment + 1).trim()))
       ) {
-        continue;
-      }
-      if (key !== "execstart") {
         continue;
       }
     }
@@ -245,14 +222,6 @@ function isOpenClawGatewayTaskName(name: string): boolean {
   return stripped === defaultName || /^openclaw gateway \(.+\)$/.test(stripped);
 }
 
-function tryExtractPlistLabel(contents: string): string | null {
-  const match = contents.match(/<key>Label<\/key>\s*<string>([\s\S]*?)<\/string>/i);
-  if (!match) {
-    return null;
-  }
-  return match[1]?.trim() || null;
-}
-
 function isIgnoredLaunchdLabel(label: string): boolean {
   return label === resolveGatewayLaunchAgentLabel();
 }
@@ -317,20 +286,30 @@ async function collectServiceFiles(params: {
 async function scanLaunchdDir(params: {
   dir: string;
   scope: "user" | "system";
+  includeManagedOpenClaw?: boolean;
+  managedLabel?: string;
 }): Promise<ExtraGatewayService[]> {
   const results: ExtraGatewayService[] = [];
   const candidates = await collectServiceFiles({
     dir: params.dir,
     extension: ".plist",
-    isIgnoredName: isIgnoredLaunchdLabel,
+    isIgnoredName: params.includeManagedOpenClaw ? () => false : isIgnoredLaunchdLabel,
   });
 
   for (const { name: labelFromName, fullPath, contents } of candidates) {
-    const label = tryExtractPlistLabel(contents) ?? labelFromName;
+    const nativeLabel = params.includeManagedOpenClaw
+      ? await readLaunchDaemonPlistLabel(fullPath)
+      : null;
+    const label =
+      nativeLabel?.status === "ok"
+        ? nativeLabel.label
+        : (parseLaunchdPlistLabel(contents) ?? labelFromName);
     const legacyLabel = isLegacyLabel(labelFromName) || isLegacyLabel(label);
     const executionMarker = detectLaunchdGatewayExecutionMarker(contents);
     const marker =
-      hasGatewayServiceMarker(contents) || executionMarker === "openclaw"
+      label === params.managedLabel ||
+      hasGatewayServiceMarker(contents) ||
+      executionMarker === "openclaw"
         ? "openclaw"
         : executionMarker === "clawdbot" || legacyLabel
           ? "clawdbot"
@@ -340,10 +319,14 @@ async function scanLaunchdDir(params: {
     }
     // Managed current services are expected; this scan reports extra jobs that
     // can compete for ports or survive old installs.
-    if (isIgnoredLaunchdLabel(label)) {
+    if (!params.includeManagedOpenClaw && isIgnoredLaunchdLabel(label)) {
       continue;
     }
-    if (marker === "openclaw" && isOpenClawGatewayLaunchdService(label, contents)) {
+    if (
+      !params.includeManagedOpenClaw &&
+      marker === "openclaw" &&
+      isOpenClawGatewayLaunchdService(label, contents)
+    ) {
       continue;
     }
     results.push({
@@ -486,7 +469,7 @@ export async function findExtraGatewayServices(
 
   if (process.platform === "darwin") {
     try {
-      const home = resolveHomeDir(env);
+      const home = resolveDaemonHomeDir(env);
       const userDir = path.join(home, "Library", "LaunchAgents");
       for (const svc of await scanLaunchdDir({
         dir: userDir,
@@ -504,6 +487,8 @@ export async function findExtraGatewayServices(
         for (const svc of await scanLaunchdDir({
           dir: path.join(path.sep, "Library", "LaunchDaemons"),
           scope: "system",
+          includeManagedOpenClaw: true,
+          managedLabel: resolveLaunchAgentLabel(env),
         })) {
           push(svc);
         }
@@ -516,13 +501,33 @@ export async function findExtraGatewayServices(
 
   if (process.platform === "linux") {
     try {
-      const home = resolveHomeDir(env);
+      const home = resolveDaemonHomeDir(env);
       const userDir = path.join(home, ".config", "systemd", "user");
-      for (const svc of await scanSystemdDir({
+      const userServices = await scanSystemdDir({
         dir: userDir,
         scope: "user",
-      })) {
+      });
+      for (const svc of userServices) {
         push(svc);
+      }
+      for (const name of LEGACY_GATEWAY_SYSTEMD_SERVICE_NAMES) {
+        const label = `${name}.service`;
+        // The unit and its managed backup are one cleanup target. Report the
+        // backup separately only when it is the remaining orphaned artifact.
+        if (userServices.some((service) => service.label === label)) {
+          continue;
+        }
+        const backupPath = path.join(userDir, `${name}.service.bak`);
+        if ((await readUtf8File(backupPath)) !== null) {
+          push({
+            platform: "linux",
+            label,
+            detail: `unit backup: ${backupPath}`,
+            scope: "user",
+            marker: "clawdbot",
+            legacy: true,
+          });
+        }
       }
       if (opts.deep) {
         for (const dir of [

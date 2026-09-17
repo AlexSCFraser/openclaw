@@ -1,23 +1,30 @@
 // Controller for the Memory destination page. The URL owns the active tab;
-// this element owns the shared agent selection, Overview status, and global
-// configuration controllers used by Settings.
+// this element projects Settings agent selection into Overview status and
+// consumes the global configuration controllers used by Settings.
 import { consume } from "@lit/context";
 import { asNullableRecord as asConfigRecord } from "@openclaw/normalization-core/record-coerce";
 import { html, type PropertyValues, type TemplateResult } from "lit";
 import { property, state } from "lit/decorators.js";
 import type { DoctorMemoryStatusPayload } from "../../../../src/gateway/server-methods/doctor.ts";
 import { pathForMemoryTab } from "../../app-route-paths.ts";
-import { applicationContext, type ApplicationContext } from "../../app/context.ts";
-import type { AgentSelectOption } from "../../components/agent-select.ts";
+import {
+  applicationContext,
+  type ApplicationContext,
+  type ApplicationGatewaySnapshot,
+} from "../../app/context.ts";
+import { readGatewayOperatorAccess } from "../../app/operator-access.ts";
+import { renderLearnMoreLink } from "../../components/settings-ui.ts";
 import { t } from "../../i18n/index.ts";
-import { listSelectableAgents, normalizeAgentLabel } from "../../lib/agents/display.ts";
-import { currentConfigObject } from "../../lib/config/index.ts";
+import { registerSettingsEnglish } from "../../i18n/locales/en-settings.ts";
+import { currentConfigObject } from "../../lib/config/config-state-model.ts";
+import { formatUiError } from "../../lib/format-error.ts";
 import { isGatewayMethodAdvertised } from "../../lib/gateway-methods.ts";
 import {
   loadPluginCatalog,
+  runPluginConfigMutation,
   setPluginEnabled,
-  type PluginCatalogItem,
 } from "../../lib/plugins/index.ts";
+import { normalizeAgentId } from "../../lib/sessions/session-key.ts";
 import { OpenClawLightDomElement } from "../../lit/openclaw-element.ts";
 import { SubscriptionsController } from "../../lit/subscriptions-controller.ts";
 import {
@@ -27,34 +34,36 @@ import {
 } from "../agents/memory/dreaming.ts";
 import "./memory-dreaming-page.ts";
 import "./memory-memories.ts";
+import { dreamingConfigPath, resolveDreamingTimezoneDefault } from "./memory-defaults.ts";
 import { renderDreamingSettings, renderDreamingUnsupported } from "./memory-dreaming.ts";
 import { renderMemoryOverview, type MemoryOverviewStatus } from "./memory-overview.ts";
 import {
   canonicalMemoryRouteLocation,
   memoryTabForRoute,
   memorySchemaKeysForTab,
-  resolveMemoryBackend,
   resolveMemoryEngineSelection,
   selectedEngineId,
   type MemoryEngineSelection,
   type MemoryTab,
 } from "./memory-schema.ts";
 import {
+  buildMemoryAddonRows,
+  buildMemoryEngineOptions,
   renderMemory,
-  type MemoryAddonRow,
-  type MemoryEngineOption,
+  findMemoryCatalogPlugin as findMemoryPlugin,
+  resolveMemoryPluginState as pluginState,
+  type MemoryCatalogState as MemoryCatalog,
+  type MemoryEngineOutcome,
   type MemoryPluginState,
 } from "./memory.ts";
 import type { ConfigRouteData } from "./route-data.ts";
 
-const MEMORY_ADDON_PLUGINS = [
-  { id: "active-memory", labelKey: "memoryPage.addons.activeMemory.title" },
-  { id: "memory-wiki", labelKey: "memoryPage.addons.memoryWiki.title" },
-] as const;
+registerSettingsEnglish();
 
 /** Explicit-off sentinel; resolveSlotSelection maps it to an `off` selection. */
 const MEMORY_SLOT_OFF = "none";
 const MEMORY_SLOT_PATH = ["plugins", "slots", "memory"];
+const DREAMING_DOCS_URL = "https://docs.openclaw.ai/concepts/dreaming";
 
 type GatewayClient = NonNullable<ApplicationContext["gateway"]["snapshot"]["client"]>;
 
@@ -62,48 +71,29 @@ type GatewayClient = NonNullable<ApplicationContext["gateway"]["snapshot"]["clie
 type CatalogConnection = {
   client: GatewayClient | null;
   connected: boolean;
+  bootId: string | undefined;
 };
 
-type MemoryCatalog =
-  | { kind: "loading" }
-  | { kind: "unavailable" }
-  | { kind: "ready"; plugins: readonly PluginCatalogItem[] };
+type MemoryAddonNotice = {
+  message: string;
+  bootId: string | undefined;
+};
 
 type MemoryPageProps = {
   configObject: Record<string, unknown>;
+  mutationDisabled: boolean;
   pluginsHref: string;
   memoryImportHref: string;
   routeData: ConfigRouteData | null;
   buildEditor: (keys: readonly string[]) => TemplateResult;
 };
 
-function isMemoryEngine(plugin: PluginCatalogItem): boolean {
-  return plugin.installed && plugin.kind?.includes("memory") === true;
-}
-
-function pluginState(
-  catalog: MemoryCatalog,
-  entry: PluginCatalogItem | undefined,
-): MemoryPluginState {
-  switch (catalog.kind) {
-    case "loading":
-      return "loading";
-    case "unavailable":
-      return "unknown";
-    default:
-      return entry?.enabled === true ? "enabled" : "disabled";
-  }
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 class MemorySettingsPage extends OpenClawLightDomElement {
   @consume({ context: applicationContext, subscribe: true })
   private context!: ApplicationContext;
 
   @property({ attribute: false }) configObject: Record<string, unknown> = {};
+  @property({ type: Boolean }) mutationDisabled = false;
   @property() pluginsHref = "";
   @property() memoryImportHref = "";
   @property({ attribute: false }) routeData: ConfigRouteData | null = null;
@@ -111,23 +101,46 @@ class MemorySettingsPage extends OpenClawLightDomElement {
 
   @state() private catalog: MemoryCatalog = { kind: "unavailable" };
   @state() private engineBusy = false;
-  @state() private engineError: string | null = null;
+  @state() private engineOutcome: MemoryEngineOutcome | null = null;
+  @state() private addonBusy = new Set<string>();
+  @state() private addonErrors = new Map<string, string>();
+  @state() private addonNotices = new Map<string, MemoryAddonNotice>();
+  @state() private addonRefreshWarnings = new Map<string, string>();
   @state() private selectedAgentId: string | null = null;
   @state() private overviewStatus: MemoryOverviewStatus = { kind: "idle" };
+  @state() private probingEmbeddings = false;
   @state() private support: DreamingConfigPathSupport = "unknown";
 
   private connection: CatalogConnection | null = null;
-  private overviewRequest: { connection: CatalogConnection; agentId: string } | null = null;
+  private pluginGeneration: number | undefined;
+  private catalogRequest = 0;
+  private overviewRequest: {
+    connection: CatalogConnection;
+    agentId: string;
+    probeEmbeddings: boolean;
+  } | null = null;
   private supportPluginId: string | null = null;
   private supportProbe: { pluginId: string } | null = null;
+  private readonly addonNoticeOperations = new Map<string, object>();
   private normalizedLocation = "";
 
   private readonly subscriptions = new SubscriptionsController(this)
+    .effect(
+      () => this.context?.settingsAgentSelection,
+      () => {
+        this.syncRouteAgent();
+        return undefined;
+      },
+    )
+    .watch(
+      () => this.context?.settingsAgentSelection,
+      (selection, notify) => selection.subscribe(notify),
+      (selection) => this.selectAgent(selection.state.selectedId),
+    )
     .watch(
       () => this.context?.gateway,
       (gateway, notify) => gateway.subscribe(notify),
-      (gateway) =>
-        this.syncGateway(gateway.snapshot.client, gateway.snapshot.phase === "connected"),
+      (gateway) => this.syncGateway(gateway.snapshot),
     )
     .watch(
       () => this.context?.runtimeConfig,
@@ -137,21 +150,18 @@ class MemorySettingsPage extends OpenClawLightDomElement {
     .watch(
       () => this.context?.agents,
       (agents, notify) => agents.subscribe(notify),
-      (agents) => {
-        if (!agents.state.agentsList && !agents.state.agentsLoading) {
-          void agents.ensureList().catch(() => undefined);
-        }
-        void this.loadOverviewStatus();
-      },
+      () => void this.loadOverviewStatus(),
     );
 
   override disconnectedCallback() {
     this.subscriptions.clear();
     this.connection = null;
     this.overviewRequest = null;
+    this.probingEmbeddings = false;
     this.catalog = { kind: "unavailable" };
     this.supportPluginId = null;
     this.supportProbe = null;
+    this.addonNoticeOperations.clear();
     super.disconnectedCallback();
   }
 
@@ -160,16 +170,37 @@ class MemorySettingsPage extends OpenClawLightDomElement {
     this.syncCanonicalLocation();
   }
 
-  protected override updated(changed: PropertyValues<this>) {
+  private syncRouteAgent() {
+    const routeAgentId = new URLSearchParams(this.routeData?.search).get("agent")?.trim();
+    const intent = this.routeData?.agentSelectionIntent;
+    const selection = this.context.settingsAgentSelection;
+    if (
+      routeAgentId &&
+      intent?.owner === selection &&
+      intent.revision === selection.intentRevision
+    ) {
+      selection.set(normalizeAgentId(routeAgentId));
+    }
+  }
+
+  protected override willUpdate(changed: PropertyValues<this>) {
     if (changed.has("routeData")) {
-      const previous = this.activeTab(
-        (changed.get("routeData") as ConfigRouteData | null | undefined) ?? null,
-      );
+      const previousRoute = changed.get("routeData") as ConfigRouteData | null | undefined;
+      const previous = this.activeTab(previousRoute ?? null);
       const current = this.activeTab();
       if (previous !== current) {
         this.overviewRequest = null;
+        this.probingEmbeddings = false;
+      }
+      this.syncRouteAgent();
+      if (previous !== current) {
         void this.loadOverviewStatus();
       }
+    }
+  }
+
+  protected override updated(changed: PropertyValues<this>) {
+    if (changed.has("routeData")) {
       this.syncCanonicalLocation();
     }
     if (changed.has("configObject")) {
@@ -180,6 +211,7 @@ class MemorySettingsPage extends OpenClawLightDomElement {
       const currentEngine = selectedEngineId(resolveMemoryEngineSelection(this.configObject));
       if (previous && previousEngine !== currentEngine) {
         this.overviewRequest = null;
+        this.probingEmbeddings = false;
         void this.loadOverviewStatus();
       }
     }
@@ -210,13 +242,31 @@ class MemorySettingsPage extends OpenClawLightDomElement {
     context.replace("memory", canonical);
   }
 
-  private syncGateway(client: GatewayClient | null, connected: boolean) {
-    if (this.connection?.client === client && this.connection.connected === connected) {
+  private syncGateway(snapshot: ApplicationGatewaySnapshot) {
+    const { client } = snapshot;
+    const connected = snapshot.phase === "connected";
+    const bootId = snapshot.hello?.server?.bootId;
+    const generation = snapshot.pluginCapabilities?.generation;
+    const pluginsChanged = generation !== this.pluginGeneration;
+    this.pluginGeneration = generation;
+    if (
+      this.connection?.client === client &&
+      this.connection.connected === connected &&
+      this.connection.bootId === bootId
+    ) {
+      if (pluginsChanged && client && connected) {
+        this.refreshPluginReads(client, this.connection);
+      }
       return;
     }
-    const connection: CatalogConnection = { client, connected };
+    const connection: CatalogConnection = { client, connected, bootId };
     this.connection = connection;
+    this.engineBusy = false;
+    this.engineOutcome = null;
+    this.addonBusy = new Set();
+    this.addonRefreshWarnings = new Map();
     this.overviewRequest = null;
+    this.probingEmbeddings = false;
     if (!client || !connected) {
       this.catalog = { kind: "unavailable" };
       if (this.activeTab() === "overview") {
@@ -228,43 +278,42 @@ class MemorySettingsPage extends OpenClawLightDomElement {
       return;
     }
     this.catalog = { kind: "loading" };
+    this.addonNotices = new Map(
+      [...this.addonNotices].filter(([, notice]) => notice.bootId && notice.bootId === bootId),
+    );
+    this.refreshPluginReads(client, connection);
+  }
+
+  private refreshPluginReads(client: GatewayClient, connection: CatalogConnection) {
+    // Publication supersedes reads, not the connection or a mutation waiting on its receipt.
+    this.overviewRequest = null;
+    this.probingEmbeddings = false;
+    this.supportPluginId = null;
+    this.supportProbe = null;
+    this.syncSupport(this.context.runtimeConfig);
     void this.loadCatalog(client, connection);
     void this.loadOverviewStatus();
   }
 
   private async loadCatalog(client: GatewayClient, connection: CatalogConnection) {
+    const request = ++this.catalogRequest;
     try {
       const result = await loadPluginCatalog(client);
-      this.applyCatalog(connection, { kind: "ready", plugins: result.plugins });
+      this.applyCatalog(connection, request, {
+        kind: "ready",
+        plugins: result.plugins,
+        mutationAllowed: result.mutationAllowed,
+      });
     } catch {
-      this.applyCatalog(connection, { kind: "unavailable" });
+      this.applyCatalog(connection, request, { kind: "unavailable" });
     }
   }
 
-  private applyCatalog(connection: CatalogConnection, catalog: MemoryCatalog) {
-    if (!this.isConnected || this.connection !== connection) {
+  private applyCatalog(connection: CatalogConnection, request: number, catalog: MemoryCatalog) {
+    if (!this.isConnected || this.connection !== connection || this.catalogRequest !== request) {
       return;
     }
     this.catalog = catalog;
-  }
-
-  private resolveAgentId(): string | null {
-    const agentsList = this.context.agents.state.agentsList;
-    const selectable = listSelectableAgents(agentsList?.agents ?? []);
-    if (this.selectedAgentId && selectable.some((agent) => agent.id === this.selectedAgentId)) {
-      return this.selectedAgentId;
-    }
-    return agentsList?.defaultId ?? selectable[0]?.id ?? null;
-  }
-
-  private agentOptions(): AgentSelectOption[] {
-    return listSelectableAgents(this.context.agents.state.agentsList?.agents ?? []).map(
-      (agent) => ({
-        value: agent.id,
-        label: normalizeAgentLabel(agent),
-        agent,
-      }),
-    );
   }
 
   private selectAgent(agentId: string | null) {
@@ -273,44 +322,53 @@ class MemorySettingsPage extends OpenClawLightDomElement {
     }
     this.selectedAgentId = agentId;
     this.overviewRequest = null;
+    this.overviewStatus = { kind: "idle" };
+    this.probingEmbeddings = false;
     void this.loadOverviewStatus();
   }
 
-  private async loadOverviewStatus(force = false) {
+  private async loadOverviewStatus(options: { force?: boolean; probeEmbeddings?: boolean } = {}) {
     if (this.activeTab() !== "overview") {
       return;
     }
     if (resolveMemoryEngineSelection(this.configObject).kind === "off") {
       this.overviewRequest = null;
       this.overviewStatus = { kind: "idle" };
+      this.probingEmbeddings = false;
       return;
     }
     const connection = this.connection;
     const client = connection?.connected ? connection.client : null;
-    const agentId = this.resolveAgentId();
+    const agentId = this.selectedAgentId;
     if (!connection || !client) {
       this.overviewStatus = {
         kind: "error",
         message: t("memoryPage.overview.hero.gatewayOffline"),
       };
+      this.probingEmbeddings = false;
       return;
     }
     if (!agentId) {
       return;
     }
     if (
-      !force &&
+      !options.force &&
       this.overviewRequest?.connection === connection &&
       this.overviewRequest.agentId === agentId
     ) {
       return;
     }
-    const request = { connection, agentId };
+    const probeEmbeddings = options.probeEmbeddings === true;
+    const request = { connection, agentId, probeEmbeddings };
     this.overviewRequest = request;
-    this.overviewStatus = { kind: "loading" };
+    this.probingEmbeddings = probeEmbeddings;
+    if (!probeEmbeddings) {
+      this.overviewStatus = { kind: "loading" };
+    }
     try {
       const payload = await client.request<DoctorMemoryStatusPayload>("doctor.memory.status", {
         agentId,
+        ...(probeEmbeddings ? { probe: true } : {}),
       });
       if (!this.isConnected || this.overviewRequest !== request) {
         return;
@@ -320,51 +378,138 @@ class MemorySettingsPage extends OpenClawLightDomElement {
       if (!this.isConnected || this.overviewRequest !== request) {
         return;
       }
-      this.overviewStatus = { kind: "error", message: errorMessage(error) };
+      this.overviewStatus = {
+        kind: "error",
+        message: formatUiError(error),
+      };
+    } finally {
+      if (this.overviewRequest === request) {
+        this.probingEmbeddings = false;
+      }
     }
-  }
-
-  private engineOptions(): MemoryEngineOption[] {
-    if (this.catalog.kind !== "ready") {
-      return [];
-    }
-    return this.catalog.plugins
-      .filter(isMemoryEngine)
-      .map((plugin) => ({ id: plugin.id, label: plugin.name }))
-      .toSorted((left, right) => left.label.localeCompare(right.label));
   }
 
   private engineState(selection: MemoryEngineSelection): MemoryPluginState {
     const engineId = selectedEngineId(selection);
-    if (engineId === null) {
-      return "unknown";
-    }
-    const catalog = this.catalog;
-    const entry =
-      catalog.kind === "ready"
-        ? catalog.plugins.find((plugin) => plugin.id === engineId)
-        : undefined;
-    return pluginState(catalog, entry);
+    return engineId === null
+      ? "unknown"
+      : pluginState(this.catalog, findMemoryPlugin(this.catalog, engineId));
   }
 
-  private addonRows(): MemoryAddonRow[] {
-    const catalog = this.catalog;
-    return MEMORY_ADDON_PLUGINS.map((addon) => {
-      const entry =
-        catalog.kind === "ready"
-          ? catalog.plugins.find((plugin) => plugin.id === addon.id)
-          : undefined;
-      return {
-        id: addon.id,
-        label: t(addon.labelKey),
-        description: entry?.description ?? addon.id,
-        state: pluginState(catalog, entry),
-      };
-    });
+  private applyPluginRefreshOutcome(
+    connection: CatalogConnection,
+    refreshError: string | null,
+    pluginId?: string,
+  ) {
+    if (this.connection !== connection) {
+      return;
+    }
+    if (!refreshError) {
+      this.addonRefreshWarnings = new Map();
+      if (this.engineOutcome?.kind === "warning") {
+        this.engineOutcome = null;
+      }
+      return;
+    }
+    const message = t("pluginsPage.configRefreshFailed", { error: refreshError });
+    if (pluginId) {
+      this.addonRefreshWarnings = new Map(this.addonRefreshWarnings).set(pluginId, message);
+    } else {
+      this.engineOutcome = { kind: "warning", message };
+    }
+  }
+
+  private async changeAddon(pluginId: string, enabled: boolean) {
+    if (
+      this.addonBusy.has(pluginId) ||
+      this.mutationDisabled ||
+      this.catalog.kind !== "ready" ||
+      !this.catalog.mutationAllowed ||
+      !readGatewayOperatorAccess(this.context.gateway.snapshot).canAdmin
+    ) {
+      return;
+    }
+    const entry = findMemoryPlugin(this.catalog, pluginId);
+    const addonState = pluginState(this.catalog, entry);
+    const connection = this.connection;
+    const client = connection?.connected ? connection.client : null;
+    if (!connection || !client || (addonState !== "enabled" && addonState !== "disabled")) {
+      return;
+    }
+    const noticeOperation = {};
+    this.addonNoticeOperations.set(pluginId, noticeOperation);
+    this.addonBusy = new Set(this.addonBusy).add(pluginId);
+    const errors = new Map(this.addonErrors);
+    errors.delete(pluginId);
+    this.addonErrors = errors;
+    const refreshWarnings = new Map(this.addonRefreshWarnings);
+    refreshWarnings.delete(pluginId);
+    this.addonRefreshWarnings = refreshWarnings;
+    try {
+      const mutation = await runPluginConfigMutation(
+        this.context.runtimeConfig,
+        client,
+        async (current) => {
+          const bootId = this.context.gateway.snapshot.hello?.server?.bootId;
+          return {
+            result: await setPluginEnabled(current, pluginId, enabled),
+            bootId,
+          };
+        },
+        { canDispatch: () => this.canDispatchPluginMutation(connection) },
+      );
+      const { result, bootId } = mutation.value;
+      const warnings = "warnings" in result ? (result.warnings ?? []) : [];
+      const notice = warnings.join(" ");
+      if (this.addonNoticeOperations.get(pluginId) === noticeOperation) {
+        this.applyPluginRefreshOutcome(connection, mutation.refreshError, pluginId);
+        const notices = new Map(this.addonNotices);
+        const currentBootId = this.context.gateway.snapshot.hello?.server?.bootId;
+        if (
+          notice &&
+          (bootId && currentBootId ? bootId === currentBootId : this.connection === connection)
+        ) {
+          notices.set(pluginId, { message: notice, bootId });
+        } else {
+          notices.delete(pluginId);
+        }
+        this.addonNotices = notices;
+      }
+      const currentConnection = this.connection;
+      if (currentConnection?.connected && currentConnection.client) {
+        await this.loadCatalog(currentConnection.client, currentConnection);
+      }
+    } catch (error) {
+      if (this.connection === connection) {
+        this.addonErrors = new Map(this.addonErrors).set(pluginId, formatUiError(error));
+      }
+    } finally {
+      if (this.addonNoticeOperations.get(pluginId) === noticeOperation) {
+        this.addonNoticeOperations.delete(pluginId);
+      }
+      if (this.connection === connection) {
+        const busy = new Set(this.addonBusy);
+        busy.delete(pluginId);
+        this.addonBusy = busy;
+      }
+    }
+  }
+
+  private canDispatchPluginMutation(connection: CatalogConnection) {
+    return (
+      this.connection === connection &&
+      !this.mutationDisabled &&
+      (this.catalog.kind !== "ready" || this.catalog.mutationAllowed) &&
+      readGatewayOperatorAccess(this.context.gateway.snapshot).canAdmin
+    );
   }
 
   private async changeEngine(engineId: string | null, currentSelection: MemoryEngineSelection) {
-    if (this.engineBusy) {
+    if (
+      this.engineBusy ||
+      this.mutationDisabled ||
+      (this.catalog.kind === "ready" && !this.catalog.mutationAllowed)
+    ) {
       return;
     }
     if (engineId === selectedEngineId(currentSelection)) {
@@ -372,8 +517,8 @@ class MemorySettingsPage extends OpenClawLightDomElement {
         return;
       }
     }
+    this.engineOutcome = null;
     if (!engineId) {
-      this.engineError = null;
       this.context.runtimeConfig.patchForm(MEMORY_SLOT_PATH, MEMORY_SLOT_OFF);
       return;
     }
@@ -383,15 +528,29 @@ class MemorySettingsPage extends OpenClawLightDomElement {
       return;
     }
     this.engineBusy = true;
-    this.engineError = null;
     try {
-      await setPluginEnabled(client, engineId, true);
-      await this.context.runtimeConfig.refresh();
-      await this.loadCatalog(client, connection);
+      const mutation = await runPluginConfigMutation(
+        this.context.runtimeConfig,
+        client,
+        (current) => setPluginEnabled(current, engineId, true),
+        { canDispatch: () => this.canDispatchPluginMutation(connection) },
+      );
+      this.applyPluginRefreshOutcome(connection, mutation.refreshError);
+      const currentConnection = this.connection;
+      if (currentConnection?.connected && currentConnection.client) {
+        await this.loadCatalog(currentConnection.client, currentConnection);
+      }
     } catch (error) {
-      this.engineError = errorMessage(error);
+      if (this.connection === connection) {
+        this.engineOutcome = {
+          kind: "error",
+          message: formatUiError(error),
+        };
+      }
     } finally {
-      this.engineBusy = false;
+      if (this.connection === connection) {
+        this.engineBusy = false;
+      }
     }
   }
 
@@ -436,32 +595,34 @@ class MemorySettingsPage extends OpenClawLightDomElement {
   }
 
   private patchDreaming(path: readonly string[], value: unknown) {
-    const runtimeConfig = this.context.runtimeConfig;
-    const writePath = [
-      "plugins",
-      "entries",
-      this.dreamingPluginId(),
-      "config",
-      "dreaming",
-      ...path,
-    ];
-    if (value === undefined) {
-      runtimeConfig.removeFormValue(writePath);
+    if (this.mutationDisabled) {
       return;
     }
-    runtimeConfig.patchForm(writePath, value);
+    const writePath = dreamingConfigPath(this.dreamingPluginId(), path);
+    if (value === undefined) {
+      this.context.runtimeConfig.removeFormValue(writePath);
+      return;
+    }
+    this.context.runtimeConfig.patchForm(writePath, value);
   }
 
   private renderDreamingControls() {
     const pluginId = this.dreamingPluginId();
     return html`
-      <p class="settings-page__intro">${t("memoryPage.dreaming.intro", { plugin: pluginId })}</p>
-      ${this.support === "unsupported"
-        ? renderDreamingUnsupported(pluginId)
-        : renderDreamingSettings({
-            dreaming: this.dreamingConfig(),
-            onPatch: (path, value) => this.patchDreaming(path, value),
-          })}
+      <p class="settings-page__intro">
+        ${t("memoryPage.dreaming.intro", { plugin: pluginId })}
+        ${renderLearnMoreLink(DREAMING_DOCS_URL)}
+      </p>
+      ${
+        this.support === "unsupported"
+          ? renderDreamingUnsupported(pluginId)
+          : renderDreamingSettings({
+              dreaming: this.dreamingConfig(),
+              timezoneDefault: resolveDreamingTimezoneDefault(this.configObjectFromController()),
+              disabled: this.mutationDisabled,
+              onPatch: (path, value) => this.patchDreaming(path, value),
+            })
+      }
     `;
   }
 
@@ -472,61 +633,63 @@ class MemorySettingsPage extends OpenClawLightDomElement {
   }
 
   override render() {
-    const runtimeConfig = this.context.runtimeConfig;
     const engineSelection = resolveMemoryEngineSelection(this.configObject);
-    const backend = resolveMemoryBackend(this.configObject);
+    const engineMutationDisabled =
+      this.mutationDisabled || (this.catalog.kind === "ready" && !this.catalog.mutationAllowed);
     const activeTab = this.activeTab();
-    const agentId = this.resolveAgentId();
-    const agents = this.agentOptions();
+    const agentId = this.selectedAgentId;
+    const agentError = agentId ? null : this.context.agents.state.agentsError;
     return renderMemory({
       activeTab,
       onTabChange: (tab) => this.navigateTab(tab),
-      engineOptions: this.engineOptions(),
+      engineOptions: buildMemoryEngineOptions(this.catalog, engineSelection),
       engineSelection,
       engineState: this.engineState(engineSelection),
-      engineBusy: this.engineBusy,
-      engineError: this.engineError,
+      engineBusy: this.engineBusy || engineMutationDisabled,
+      engineOutcome: this.engineOutcome,
       onEngineChange: (nextEngineId) => void this.changeEngine(nextEngineId, engineSelection),
-      backend,
-      backendBusy: runtimeConfig.state.configSaving || runtimeConfig.state.configApplying,
-      onBackendChange: (next) => runtimeConfig.patchForm(["memory", "backend"], next),
-      addons: this.addonRows(),
+      addons: buildMemoryAddonRows(this.catalog, {
+        busy: this.addonBusy,
+        errors: this.addonErrors,
+        notices: this.addonNotices,
+        refreshWarnings: this.addonRefreshWarnings,
+      }),
+      canToggleAddons:
+        this.catalog.kind === "ready" &&
+        this.catalog.mutationAllowed &&
+        !this.mutationDisabled &&
+        readGatewayOperatorAccess(this.context.gateway.snapshot).canAdmin,
+      onAddonChange: (pluginId, enabled) => void this.changeAddon(pluginId, enabled),
       pluginsHref: this.pluginsHref,
       memoryImportHref: this.memoryImportHref,
+      canImportMemory: readGatewayOperatorAccess(this.context.gateway.snapshot).canAdmin,
       overview: renderMemoryOverview({
         agentId,
-        agents,
         engineSelection,
         engineDisabled: this.engineState(engineSelection) === "disabled",
-        status: this.overviewStatus,
-        onAgentChange: (next) => this.selectAgent(next),
-        onRefresh: () => void this.loadOverviewStatus(true),
+        status: agentError ? { kind: "error", message: agentError } : this.overviewStatus,
+        probingEmbeddings: this.probingEmbeddings,
+        onRefresh: () =>
+          agentId
+            ? void this.loadOverviewStatus({ force: true })
+            : void this.context.agents.ensureList(),
+        onProbeEmbeddings: () =>
+          void this.loadOverviewStatus({ force: true, probeEmbeddings: true }),
         onNavigate: (tab) => this.navigateTab(tab),
       }),
       memories: html`
         <openclaw-memory-memories
           .client=${this.context.gateway.snapshot.client}
           .connected=${this.context.gateway.snapshot.phase === "connected"}
-          .methodAdvertised=${isGatewayMethodAdvertised(
-            this.context.gateway.snapshot,
-            "memory.search",
-          ) === true}
+          .methodAdvertised=${
+            isGatewayMethodAdvertised(this.context.gateway.snapshot, "memory.search") === true
+          }
           .agentId=${agentId}
-          .agents=${agents}
-          .onAgentChange=${(next: string | null) => this.selectAgent(next)}
         ></openclaw-memory-memories>
       `,
-      dreams: html`
-        <openclaw-memory-dreaming
-          .agentId=${agentId}
-          .agents=${agents}
-          .onAgentChange=${(next: string | null) => this.selectAgent(next)}
-        ></openclaw-memory-dreaming>
-      `,
+      dreams: html` <openclaw-memory-dreaming .agentId=${agentId}></openclaw-memory-dreaming> `,
       editor:
-        activeTab === "settings"
-          ? this.buildEditor(memorySchemaKeysForTab("settings", backend))
-          : html``,
+        activeTab === "settings" ? this.buildEditor(memorySchemaKeysForTab("settings")) : html``,
       dreamingSettings: activeTab === "settings" ? this.renderDreamingControls() : html``,
     });
   }
@@ -540,6 +703,7 @@ export function renderMemoryPage(props: MemoryPageProps) {
   return html`
     <openclaw-memory-settings
       .configObject=${props.configObject}
+      .mutationDisabled=${props.mutationDisabled}
       .pluginsHref=${props.pluginsHref}
       .memoryImportHref=${props.memoryImportHref}
       .routeData=${props.routeData}

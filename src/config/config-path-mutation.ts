@@ -1,23 +1,13 @@
 // Applies immutable path removals to config-like objects.
 import { isDeepStrictEqual } from "node:util";
 import { expectDefined } from "@openclaw/normalization-core";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { isBlockedObjectKey } from "../infra/prototype-keys.js";
 import { parseConfigPathArrayIndex } from "../shared/path-array-index.js";
 import type { OpenClawConfig } from "./types.js";
 
 const MANAGED_CONFIG_UNSET_PATHS = [["plugins", "installs"]] as const;
 const WRITE_PRUNED_OBJECT = Symbol("write-pruned-object");
-
-function isWritePlainObject(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function coerceConfig(value: unknown): OpenClawConfig {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return {};
-  }
-  return value as OpenClawConfig;
-}
 
 function unsetPathForWriteAt(
   value: unknown,
@@ -35,12 +25,9 @@ function unsetPathForWriteAt(
     if (index === undefined || index >= value.length) {
       return { changed: false, value };
     }
-    if (isLeaf) {
-      const next = value.slice();
-      next.splice(index, 1);
-      return { changed: true, value: next };
-    }
-    const child = unsetPathForWriteAt(value[index], pathSegments, depth + 1);
+    const child = isLeaf
+      ? { changed: true, value: WRITE_PRUNED_OBJECT }
+      : unsetPathForWriteAt(value[index], pathSegments, depth + 1);
     if (!child.changed) {
       return { changed: false, value };
     }
@@ -53,19 +40,12 @@ function unsetPathForWriteAt(
     return { changed: true, value: next };
   }
 
-  if (isBlockedObjectKey(segment) || !isWritePlainObject(value) || !Object.hasOwn(value, segment)) {
+  if (isBlockedObjectKey(segment) || !isRecord(value) || !Object.hasOwn(value, segment)) {
     return { changed: false, value };
   }
-  if (isLeaf) {
-    const next: Record<string, unknown> = { ...value };
-    delete next[segment];
-    return {
-      changed: true,
-      value: Object.keys(next).length === 0 ? WRITE_PRUNED_OBJECT : next,
-    };
-  }
-
-  const child = unsetPathForWriteAt(value[segment], pathSegments, depth + 1);
+  const child = isLeaf
+    ? { changed: true, value: WRITE_PRUNED_OBJECT }
+    : unsetPathForWriteAt(value[segment], pathSegments, depth + 1);
   if (!child.changed) {
     return { changed: false, value };
   }
@@ -95,8 +75,8 @@ function unsetPathForWrite(
   if (result.value === WRITE_PRUNED_OBJECT) {
     return { changed: true, next: {} };
   }
-  if (isWritePlainObject(result.value)) {
-    return { changed: true, next: coerceConfig(result.value) };
+  if (isRecord(result.value)) {
+    return { changed: true, next: result.value as OpenClawConfig };
   }
   return { changed: false, next: root };
 }

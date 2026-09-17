@@ -19,8 +19,10 @@ type PostUpdateLaunchAgentRecoveryDeps = {
 export async function recoverInstalledLaunchAgentAfterUpdate(params: {
   service?: GatewayService;
   env?: NodeJS.ProcessEnv;
+  assertCurrent?: () => void;
   deps?: PostUpdateLaunchAgentRecoveryDeps;
 }): Promise<PostUpdateLaunchAgentRecoveryResult> {
+  params.assertCurrent?.();
   const platform = params.deps?.platform ?? process.platform;
   if (platform !== "darwin") {
     return { attempted: false, recovered: false };
@@ -30,16 +32,23 @@ export async function recoverInstalledLaunchAgentAfterUpdate(params: {
   const readState = params.deps?.readState ?? readGatewayServiceState;
   const recover = params.deps?.recover ?? recoverInstalledLaunchAgent;
   const state = await readState(service, { env: params.env }).catch(() => null);
-  if (state?.loaded) {
-    return { attempted: false, recovered: false };
-  }
-  if (state && !state.installed && !state.runtime?.missingSupervision) {
+  params.assertCurrent?.();
+  if (!state || state.loadState.status !== "not-loaded" || !state.installed) {
     return { attempted: false, recovered: false };
   }
 
-  const recovered = await recover({ result: "restarted", env: state?.env ?? params.env }).catch(
-    () => null,
-  );
+  let recovered: Awaited<ReturnType<typeof recover>>;
+  try {
+    recovered = await recover({ result: "restarted", env: state.env });
+    params.assertCurrent?.();
+  } catch (error) {
+    params.assertCurrent?.();
+    return {
+      attempted: true,
+      recovered: false,
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
   if (!recovered) {
     return {
       attempted: true,

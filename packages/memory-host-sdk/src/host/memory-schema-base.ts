@@ -1,10 +1,37 @@
-import { MEMORY_INDEX_CHUNKS_TABLE, MEMORY_INDEX_SOURCES_TABLE } from "./memory-schema-fts.js";
-import { MEMORY_INDEX_CHUNK_PROVENANCE_SCHEMA_SQL } from "./memory-schema-provenance.js";
+import {
+  MEMORY_INDEX_CHUNKS_TABLE,
+  MEMORY_INDEX_SOURCES_TABLE,
+  MEMORY_INDEX_FTS_TABLE,
+  MEMORY_INDEX_PATHS_FTS_TABLE,
+} from "./memory-schema-fts.js";
+import {
+  MEMORY_INDEX_CHUNK_PROVENANCE_SCHEMA_SQL,
+  MEMORY_INDEX_CHUNK_PROVENANCE_TABLE,
+} from "./memory-schema-provenance.js";
+import {
+  MEMORY_INDEX_CHUNK_RECALL_METADATA_SCHEMA_SQL,
+  MEMORY_INDEX_CHUNK_RECALL_METADATA_TABLE,
+} from "./memory-schema-recall.js";
 
 export const MEMORY_INDEX_META_TABLE = "memory_index_meta";
 export const MEMORY_EMBEDDING_CACHE_TABLE = "memory_embedding_cache";
 export const MEMORY_INDEX_STATE_TABLE = "memory_index_state";
 export const MEMORY_INDEX_VECTOR_TABLE = "memory_index_chunks_vec";
+
+// Only rebuildable index state belongs here, in child-before-parent drop order.
+// Origins, tombstones, and canonical sessions are durable owners, not index data.
+export const MEMORY_INDEX_DERIVED_TABLES = [
+  MEMORY_INDEX_VECTOR_TABLE,
+  MEMORY_INDEX_FTS_TABLE,
+  MEMORY_INDEX_PATHS_FTS_TABLE,
+  MEMORY_INDEX_CHUNK_RECALL_METADATA_TABLE,
+  MEMORY_INDEX_CHUNK_PROVENANCE_TABLE,
+  MEMORY_INDEX_CHUNKS_TABLE,
+  MEMORY_INDEX_SOURCES_TABLE,
+  MEMORY_INDEX_META_TABLE,
+  MEMORY_EMBEDDING_CACHE_TABLE,
+  MEMORY_INDEX_STATE_TABLE,
+] as const;
 
 export function buildMemoryIndexStrictSchema(params: {
   embeddingCacheTable: string;
@@ -48,11 +75,9 @@ export function buildMemoryIndexStrictSchema(params: {
       model TEXT NOT NULL,
       text TEXT NOT NULL,
       embedding TEXT NOT NULL,
-      updated_at INTEGER NOT NULL,
-      importance INTEGER CHECK (importance IS NULL OR importance BETWEEN 1 AND 10),
-      triggers TEXT,
-      project_key TEXT
+      updated_at INTEGER NOT NULL
     ) STRICT;
+    ${MEMORY_INDEX_CHUNK_RECALL_METADATA_SCHEMA_SQL}
     ${MEMORY_INDEX_CHUNK_PROVENANCE_SCHEMA_SQL}
     CREATE TABLE IF NOT EXISTS ${MEMORY_INDEX_STATE_TABLE} (
       id INTEGER PRIMARY KEY CHECK (id = 1),

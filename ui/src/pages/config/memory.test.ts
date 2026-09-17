@@ -2,12 +2,12 @@
 
 import { html, render } from "lit";
 import { describe, expect, it, vi } from "vitest";
+import { renderConfigForm } from "../../components/config-form.ts";
 import {
   memorySchemaKeysForTab,
   memoryTabForRoute,
   memoryVisibleSchemaKeys,
   narrowMemorySchema,
-  resolveMemoryBackend,
 } from "./memory-schema.ts";
 import { renderMemory } from "./memory.ts";
 
@@ -19,28 +19,39 @@ function createProps(overrides: Partial<MemoryViewProps> = {}): MemoryViewProps 
     activeTab: "settings",
     onTabChange: vi.fn(),
     engineOptions: [
-      { id: "memory-core", label: "Memory Core" },
-      { id: "memory-lancedb", label: "Memory LanceDB" },
+      { id: "memory-core", label: "OpenClaw Memory", available: true },
+      { id: "memory-lancedb", label: "Memory LanceDB", available: true },
     ],
     engineSelection: { kind: "auto", engineId: "memory-core" },
     engineState: "enabled",
     engineBusy: false,
-    engineError: null,
+    engineOutcome: null,
     onEngineChange: vi.fn(),
-    backend: "builtin",
-    backendBusy: false,
-    onBackendChange: vi.fn(),
     addons: [
       {
         id: "active-memory",
         label: "Active memory",
         description: "Recent context",
         state: "enabled",
+        busy: false,
+        error: null,
+        notice: null,
       },
-      { id: "memory-wiki", label: "Memory wiki", description: "Wiki pages", state: "disabled" },
+      {
+        id: "memory-wiki",
+        label: "Memory wiki",
+        description: "Wiki pages",
+        state: "disabled",
+        busy: false,
+        error: null,
+        notice: null,
+      },
     ],
+    canToggleAddons: true,
+    onAddonChange: vi.fn(),
     pluginsHref: "/settings/plugins",
     memoryImportHref: "/memory-import",
+    canImportMemory: true,
     overview: html`<div class="test-overview"></div>`,
     memories: html`<div class="test-memories"></div>`,
     dreams: html`<div class="test-dreams"></div>`,
@@ -57,6 +68,30 @@ function renderInto(props: MemoryViewProps): HTMLElement {
 }
 
 describe("renderMemory", () => {
+  it.each(["overview", "memories", "dreams"] as const)(
+    "renders the Memory tabs without a duplicate agent picker on %s",
+    (activeTab) => {
+      const container = renderInto(createProps({ activeTab }));
+      const header = container.querySelector(".hub-page-header");
+
+      expect(header?.querySelector(".page-title")?.textContent).toBe("Memory");
+      expect(header?.querySelector(".page-subtitle")?.textContent).toContain(
+        "Choose how OpenClaw stores, searches, and maintains agent memory.",
+      );
+      expect(header?.querySelector(".memory-hub-tabs")).not.toBeNull();
+      expect(container.textContent).not.toContain("Agent view");
+
+      expect(header?.querySelector("openclaw-agent-select")).toBeNull();
+    },
+  );
+
+  it("replaces the memory-import link with an admin-required note", () => {
+    const container = renderInto(createProps({ canImportMemory: false }));
+
+    expect(container.querySelector('a[href="/memory-import"]')).toBeNull();
+    expect(container.textContent).toContain("Memory import requires operator.admin access.");
+  });
+
   it("shows the exclusive engine choice as one radio group over installed engines", () => {
     const container = renderInto(createProps());
 
@@ -74,17 +109,43 @@ describe("renderMemory", () => {
   it("reports whether the engine came from config or from the slot default", () => {
     const auto = renderInto(createProps());
     expect(auto.textContent).toContain("falls back to its default owner");
+    expect(auto.textContent).toContain("Using default: OpenClaw Memory");
 
     const pinned = renderInto(
       createProps({ engineSelection: { kind: "pinned", engineId: "memory-core" } }),
     );
     expect(pinned.textContent).toContain("pinned in config");
+    expect(pinned.textContent).toContain("Default: OpenClaw Memory");
+  });
+
+  it("keeps a configured missing engine selected and labels it unavailable", () => {
+    const container = renderInto(
+      createProps({
+        engineOptions: [{ id: "retired-memory", label: "retired-memory", available: false }],
+        engineSelection: { kind: "pinned", engineId: "retired-memory" },
+        engineState: "unknown",
+      }),
+    );
+
+    expect(
+      container
+        .querySelector('wa-radio[value="retired-memory"]')
+        ?.textContent?.replace(/\s+/g, " ")
+        .trim(),
+    ).toBe("retired-memory (Unavailable)");
+    expect(
+      container
+        .querySelector('wa-radio[value="retired-memory"]')
+        ?.classList.contains("settings-segmented__btn--active"),
+    ).toBe(true);
   });
 
   it("surfaces a failed engine write next to the control", () => {
     expect(renderInto(createProps()).textContent).not.toContain("Could not change");
 
-    const failed = renderInto(createProps({ engineError: "gateway rejected the change" }));
+    const failed = renderInto(
+      createProps({ engineOutcome: { kind: "error", message: "gateway rejected the change" } }),
+    );
     expect(failed.textContent).toContain("Could not change the memory engine");
     expect(failed.textContent).toContain("gateway rejected the change");
   });
@@ -98,35 +159,83 @@ describe("renderMemory", () => {
     expect(container.textContent).not.toContain("pinned in config");
   });
 
-  it("hides the retrieval backend row for an engine that owns its own retrieval", () => {
-    expect(renderInto(createProps({ backend: "builtin" })).textContent).toContain(
-      "Retrieval backend",
-    );
-    expect(renderInto(createProps({ backend: null })).textContent).not.toContain(
-      "Retrieval backend",
-    );
-  });
-
-  it("renders add-on layering with per-plugin state and a Plugins link", () => {
+  it("renders enabled and disabled add-ons as accessible toggles", () => {
     const container = renderInto(createProps());
 
-    expect(container.textContent).toContain("Active memory");
-    expect(container.textContent).toContain("Memory wiki");
-    expect(container.textContent).toContain("Enabled");
-    expect(container.textContent).toContain("Disabled");
+    const switches = [
+      ...container.querySelectorAll<HTMLElement & { checked: boolean }>("wa-switch"),
+    ];
+    expect(switches).toHaveLength(2);
+    expect(switches[0]?.checked).toBe(true);
+    expect(switches[1]?.checked).toBe(false);
+    expect(switches[0]?.textContent).toContain("Enable or disable Active memory");
+    expect(switches[1]?.textContent).toContain("Enable or disable Memory wiki");
     const link = container.querySelector<HTMLAnchorElement>("a.memory-page__link");
     expect(link?.getAttribute("href")).toBe("/settings/plugins");
+  });
+
+  it("uses read-only add-on statuses when mutations are not authorized", () => {
+    const container = renderInto(createProps({ canToggleAddons: false }));
+
+    expect(container.querySelector("wa-switch")).toBeNull();
+    expect(container.textContent).toContain("Enabled");
+    expect(container.textContent).toContain("Disabled");
+    expect(container.textContent).toContain("Open Plugins");
+  });
+
+  it("keeps mutation busy and errors scoped to one add-on row", () => {
+    const container = renderInto(
+      createProps({
+        addons: [
+          {
+            id: "active-memory",
+            label: "Active memory",
+            description: "Recent context",
+            state: "enabled",
+            busy: true,
+            error: "gateway rejected the change",
+            notice: null,
+          },
+          {
+            id: "memory-wiki",
+            label: "Memory wiki",
+            description: "Wiki pages",
+            state: "disabled",
+            busy: false,
+            error: null,
+            notice: null,
+          },
+        ],
+      }),
+    );
+    const switches = [...container.querySelectorAll<HTMLElement>("wa-switch")];
+    expect(switches[0]?.hasAttribute("disabled")).toBe(true);
+    expect(switches[1]?.hasAttribute("disabled")).toBe(false);
+    expect(container.textContent).toContain("Could not update Active memory");
+    expect(container.textContent).toContain("gateway rejected the change");
+    expect(container.textContent).not.toContain("Could not update Memory wiki");
   });
 
   it("never states an add-on is off while the catalog is unread", () => {
     for (const state of ["loading", "unknown"] as const) {
       const container = renderInto(
         createProps({
-          addons: [{ id: "active-memory", label: "Active memory", description: "x", state }],
+          addons: [
+            {
+              id: "active-memory",
+              label: "Active memory",
+              description: "x",
+              state,
+              busy: false,
+              error: null,
+              notice: null,
+            },
+          ],
         }),
       );
       expect(container.textContent).not.toContain("Disabled");
       expect(container.textContent).not.toContain("Enabled");
+      expect(container.querySelector("wa-switch")).toBeNull();
     }
   });
 
@@ -146,6 +255,55 @@ describe("renderMemory", () => {
     expect(dreams.querySelector(".test-dreams")).not.toBeNull();
     expect(dreams.querySelector(".test-editor")).toBeNull();
   });
+
+  it("shows the shared advanced disclosure only on Settings and reveals advanced fields", () => {
+    const onAdvancedChange = vi.fn();
+    const editor = (showAdvanced: boolean) =>
+      html`${renderConfigForm({
+        schema: {
+          type: "object",
+          properties: {
+            memory: {
+              type: "object",
+              properties: {
+                enabled: { type: "boolean", title: "Common memory field" },
+                extraPaths: { type: "string", title: "Advanced memory field" },
+              },
+            },
+          },
+        },
+        uiHints: {
+          "memory.enabled": { advanced: false },
+          "memory.extraPaths": { advanced: true },
+        },
+        value: { memory: { enabled: true, extraPaths: "/notes" } },
+        activeSection: "memory",
+        embedded: true,
+        showAdvanced,
+        onShowAdvanced: () => onAdvancedChange(true),
+        onHideAdvanced: () => onAdvancedChange(false),
+        onPatch: vi.fn(),
+      })}`;
+
+    const collapsed = renderInto(createProps({ editor: editor(false) }));
+    const show = collapsed.querySelector<HTMLDetailsElement>("details.config-advanced-disclosure");
+    expect(show?.open).toBe(false);
+    expect(collapsed.textContent).not.toContain("Advanced memory field");
+    show!.open = true;
+    show!.dispatchEvent(new Event("toggle"));
+    expect(onAdvancedChange).toHaveBeenCalledWith(true);
+
+    const expanded = renderInto(createProps({ editor: editor(true) }));
+    const hide = expanded.querySelector<HTMLDetailsElement>("details.config-advanced-disclosure");
+    expect(hide?.open).toBe(true);
+    expect(expanded.textContent).toContain("Advanced memory field");
+    hide!.open = false;
+    hide!.dispatchEvent(new Event("toggle"));
+    expect(onAdvancedChange).toHaveBeenCalledWith(false);
+
+    const overview = renderInto(createProps({ activeTab: "overview", editor: editor(false) }));
+    expect(overview.querySelector("details.config-advanced-disclosure")).toBeNull();
+  });
 });
 
 describe("memoryTabForRoute", () => {
@@ -158,7 +316,7 @@ describe("memoryTabForRoute", () => {
   });
 
   it("routes old tabless schema links to Settings without changing the plain landing", () => {
-    expect(memoryTabForRoute({ section: "memory", targetBlockId: "memory-backend" })).toBe(
+    expect(memoryTabForRoute({ section: "memory", targetBlockId: "config-section-memory" })).toBe(
       "settings",
     );
     expect(memoryTabForRoute({ targetBlockId: "config-section-memory" })).toBe("settings");
@@ -171,7 +329,7 @@ describe("memoryTabForRoute", () => {
         pathname: "/settings/memory/dreams",
         tab: "settings",
         section: "memory",
-        targetBlockId: "memory-backend",
+        targetBlockId: "config-section-memory",
       }),
     ).toBe("dreams");
     expect(memoryTabForRoute({ pathname: "/settings/memory" })).toBe("overview");
@@ -179,46 +337,17 @@ describe("memoryTabForRoute", () => {
 });
 
 describe("memorySchemaKeysForTab", () => {
-  it("reveals qmd sub-config only when qmd is the selected backend", () => {
-    expect(memorySchemaKeysForTab("overview", "builtin")).toEqual([]);
-    expect(memorySchemaKeysForTab("memories", "builtin")).toEqual([]);
-    expect(memorySchemaKeysForTab("dreams", "qmd")).toEqual([]);
-    expect(memorySchemaKeysForTab("settings", "builtin")).toEqual(["citations", "search"]);
-    expect(memorySchemaKeysForTab("settings", "qmd")).toEqual(["citations", "qmd", "search"]);
-    // No applicable backend: qmd's sub-config belongs to a backend nothing reads.
-    expect(memorySchemaKeysForTab("settings", null)).toEqual(["citations", "search"]);
+  it("shows builtin memory settings only on Settings", () => {
+    expect(memorySchemaKeysForTab("overview")).toEqual([]);
+    expect(memorySchemaKeysForTab("memories")).toEqual([]);
+    expect(memorySchemaKeysForTab("dreams")).toEqual([]);
+    expect(memorySchemaKeysForTab("settings")).toEqual(["citations", "search"]);
   });
 });
 
 describe("memoryVisibleSchemaKeys", () => {
-  it("hides qmd until qmd is the selected backend and backend when no engine reads it", () => {
-    expect([...memoryVisibleSchemaKeys("builtin")].toSorted()).toEqual([
-      "backend",
-      "citations",
-      "search",
-    ]);
-    expect([...memoryVisibleSchemaKeys("qmd")].toSorted()).toEqual([
-      "backend",
-      "citations",
-      "qmd",
-      "search",
-    ]);
-    expect([...memoryVisibleSchemaKeys(null)].toSorted()).toEqual(["citations", "search"]);
-  });
-});
-
-describe("resolveMemoryBackend", () => {
-  it("reports a backend only for the memory-core slot owner", () => {
-    expect(resolveMemoryBackend({})).toBe("builtin");
-    expect(resolveMemoryBackend({ memory: { backend: "qmd" } })).toBe("qmd");
-    // Another engine owns the slot, so nothing reads memory.backend.
-    expect(
-      resolveMemoryBackend({
-        memory: { backend: "qmd" },
-        plugins: { slots: { memory: "memory-lancedb" } },
-      }),
-    ).toBeNull();
-    expect(resolveMemoryBackend({ plugins: { slots: { memory: "none" } } })).toBeNull();
+  it("matches the builtin Settings editor", () => {
+    expect(memoryVisibleSchemaKeys()).toEqual(["citations", "search"]);
   });
 });
 
@@ -229,10 +358,8 @@ describe("narrowMemorySchema", () => {
       memory: {
         type: "object",
         properties: {
-          backend: { type: "string" },
           citations: { type: "string" },
           search: { type: "object" },
-          qmd: { type: "object" },
         },
       },
       tools: { type: "object" },

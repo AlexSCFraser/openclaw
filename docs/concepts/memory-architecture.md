@@ -47,17 +47,18 @@ Five rules shape everything below:
 
 ## The tier model
 
-| Tier         | Surface                                                 | Written by                                          | Injected                           |
-| ------------ | ------------------------------------------------------- | --------------------------------------------------- | ---------------------------------- |
-| Instructions | `AGENTS.md` and workspace instruction files             | Human only                                          | Always, at session start           |
-| Curated core | `MEMORY.md`, `USER.md`                                  | Dreaming consolidation; direct user request         | Always, at session start, budgeted |
-| Episodic     | `memory/YYYY-MM-DD.md` daily notes, session transcripts | Agent during work; memory flush; transcript capture | Never; searchable on demand        |
-| Prospective  | Standing intents (SQLite) and cron jobs                 | `intent` tool; scheduled tasks                      | Only when a trigger fires          |
-| Review       | `DREAMS.md`, dreaming reports                           | Dreaming phases                                     | Never; for human reading           |
+| Tier         | Surface                                                 | Written by                                          | Injected                                               |
+| ------------ | ------------------------------------------------------- | --------------------------------------------------- | ------------------------------------------------------ |
+| Instructions | `AGENTS.md` and workspace instruction files             | Human only                                          | Always, at session start                               |
+| Curated core | `MEMORY.md`, `USER.md`                                  | Dreaming consolidation; direct user request         | At session start when provenance is eligible; budgeted |
+| Episodic     | `memory/YYYY-MM-DD.md` daily notes, session transcripts | Agent during work; memory flush; transcript capture | Never; searchable on demand                            |
+| Prospective  | Standing intents (SQLite) and cron jobs                 | `intent` tool; scheduled tasks                      | Only when a trigger fires                              |
+| Review       | `DREAMS.md`, dreaming reports                           | Dreaming phases                                     | Never; for human reading                               |
 
 The boundary that matters most is between the **curated core** and the
-**episodic** tier. Curated files are small, always in context, and written
-only through gated consolidation. Episodic files are large, append-friendly,
+**episodic** tier. Curated files are small, normally in context when their
+provenance is eligible, and written only through gated consolidation. Episodic
+files are large, append-friendly,
 and reachable only through explicit search tools or the escalation lane.
 Nothing crosses from episodic to curated without passing the promotion gates
 described below.
@@ -95,6 +96,15 @@ noise, and recall feedback loops:
   structurally marked and never re-extracted as a new memory. A fact recalled
   one hundred times stays one fact.
 
+Beyond per-chunk trust metadata, automatic session ingestion records source
+sessions for its staged entries. Consolidation carries those origins forward,
+so `openclaw memory forget` can remove tracked entries derived from selected
+sessions and exclude those session IDs from future ingestion. Separately,
+admission policy can exclude matching sources from dreaming ingestion and session backfill.
+Neither control covers every workspace write or retained copy; see the
+coverage, retained-data boundaries, and operator workflow in
+[Memory provenance and deletion](/concepts/memory-provenance).
+
 ## Trust boundaries and limits
 
 Workspace memory files are inside the operator trust boundary: any process
@@ -104,11 +114,15 @@ classified from the sender, while a memory flush records the least-trusted
 class for the whole file; trusted lines in a downgraded file intentionally lose
 promotion eligibility so untrusted content cannot ride a trusted file hash.
 
-The current runtime does not propagate content origin within an owner turn.
-Assistant text derived from tool or web output therefore inherits the turn's
-sender class. A follow-up should carry content-origin metadata through tool-result
-assembly into assistant output and flush writes; that cross-cutting taint model
-is not part of this memory integration.
+Content origin also propagates within a turn. When a tool result declares
+network-sourced content (web fetches, browser reads, search results), the rest
+of that turn is marked tainted: every assistant message produced after that
+result carries the taint, and memory classification treats it as `untrusted`
+even inside an owner turn. The taint clears on the next user message. The
+remaining gap is declaration coverage: only tools that declare their results
+as network-sourced participate, so output from tools that do not — local file
+reads, for example — does not taint the turn, and assistant text derived from
+it keeps its normal turn-derived provenance (`agent` in an owner turn).
 
 ## The write path
 
@@ -171,7 +185,12 @@ touching long-term memory.
 The consolidation output is accepted only if it passes structural
 validation, stays within the bootstrap file budget, and does not lose more
 than a bounded fraction of existing entries. A rejected rewrite falls back
-to the previous append-only behavior for that sweep.
+to append-only behavior for that sweep. Promotion uses the smallest configured
+per-file bootstrap limit among agents sharing the workspace, capped by the
+writer's own limit. If an append still cannot fit after older generated
+sections are removed, the writer preserves `MEMORY.md` unchanged and leaves
+the candidates eligible for a later sweep instead of committing an oversized
+file.
 
 **Write safety.** Replacing `MEMORY.md` uses optimistic concurrency: the
 content hash captured when consolidation input was built is re-checked
@@ -193,8 +212,12 @@ that need it.
 
 Three mechanisms run on eligible turns with no model involvement:
 
-- **Bootstrap injection.** `MEMORY.md` and `USER.md` load at session start
-  within budgets, and refresh per turn so long-lived sessions pick up
+- **Bootstrap injection.** When a memory runtime is selected, `MEMORY.md` and
+  `USER.md` load at session start only when that runtime classifies their
+  provenance as eligible. Ineligible, missing, or unsupported classifications
+  are omitted from automatic context but remain available through explicit
+  memory tools. With no selected memory runtime, bootstrap behavior is unchanged.
+  Eligible files refresh per turn within budgets so long-lived sessions pick up
   consolidation results without restarting.
 - **Ranked search.** `memory_search` scores hybrid relevance multiplied by
   an exponential recency decay (30-day half-life) and an importance
@@ -264,20 +287,30 @@ cached for the process lifetime; semicolons are escaped so one key cannot become
 multiple list entries, and recall never starts Git once per message.
 
 Project scope changes ranking and automatic injection without partitioning the
-files. Ranked search boosts entries from the active repository, mildly demotes
-entries from another repository, and leaves untagged memory neutral. Trigger
-injection is stricter: a tagged entry is eligible only while its repository is
-active. Each full turn also gets a compact, separately budgeted project-memory
-block built from curated entries for that repository. `USER.md` and standing
-intents remain user-level and are never project-scoped.
+files. Each session keeps up to four recently active repository keys in
+most-recent-first order. Preparing a repository moves its key to the front and
+evicts the least-recent key beyond that cap. This set is ephemeral runtime
+state: it is not persisted or restored, so a new session or process starts with
+an empty set. The current repository identity remains a separate prepared fact
+used for write annotations; new repository-specific memories receive only that
+current key, not the whole active set. Ranked search boosts entries from any
+repository in the active set, mildly demotes entries from another repository,
+and leaves untagged memory neutral. Trigger injection is stricter: a tagged
+entry is eligible only while every project key on that entry is in the active
+set. Each full turn also gets a compact, separately budgeted project-memory
+block built from curated entries for the active repositories. All retained keys
+have the same boost; recency only controls promotion and eviction. `USER.md` and
+standing intents remain user-level and are never project-scoped.
 
 This matters most for a many-repository worker: a build workaround learned in
 one codebase should not silently steer work in another. In one continuous
 repository session, the annotation is mostly invisible; ranking and bootstrap
 refresh preserve the same learned context across compaction and dreaming. A
-session that moves to another repository updates its active identity on the next
-turn, and a sub-agent derives its own identity rather than inheriting its
-parent's. Sessions outside repositories retain the previous global behavior.
+session that moves to another repository keeps both repositories active until
+recency eviction, while a sub-agent derives its own active set rather than
+inheriting its parent's. A session that starts outside a repository retains the
+previous global behavior; leaving a repository does not clear keys already
+active in that session.
 
 The boundary follows the same research result as the rest of recall: selective,
 query-relevant context outperforms indiscriminate history as sessions and
@@ -395,18 +428,20 @@ authority in a future session.
 Memory architecture is mostly convention over configuration; these are the
 knobs that exist:
 
-| Concern                         | Where                                                           | Reference                                                        |
-| ------------------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------- |
-| Dreaming enable, cadence, model | `plugins.entries.memory-core.config.dreaming`                   | [Dreaming](/concepts/dreaming)                                   |
-| Search providers, hybrid tuning | `memory.search`                                                 | [Memory config](/reference/memory-config)                        |
-| Escalation lane mode, scope     | `plugins.entries.active-memory`                                 | [Active memory](/concepts/active-memory)                         |
-| Cross-conversation recall       | `agents.entries.<id>.memory.search.rememberAcrossConversations` | [Active memory](/concepts/active-memory)                         |
-| Flush behavior                  | `agents.defaults.compaction.memoryFlush`                        | [Memory overview](/concepts/memory)                              |
-| Backend selection               | plugin slots                                                    | [Builtin](/concepts/memory-builtin), [QMD](/concepts/memory-qmd) |
+| Concern                         | Where                                                           | Reference                                                     |
+| ------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------- |
+| Dreaming enable, cadence, model | `plugins.entries.memory-core.config.dreaming`                   | [Dreaming](/concepts/dreaming)                                |
+| Session admission exclusions    | `plugins.entries.memory-core.config.memoryPolicy`               | [Provenance & deletion](/concepts/memory-provenance)          |
+| Search providers, hybrid tuning | `memory.search`                                                 | [Memory config](/reference/memory-config)                     |
+| Escalation lane mode, scope     | `plugins.entries.active-memory`                                 | [Active memory](/concepts/active-memory)                      |
+| Cross-conversation recall       | `agents.entries.<id>.memory.search.rememberAcrossConversations` | [Active memory](/concepts/active-memory)                      |
+| Flush behavior                  | `agents.defaults.compaction.memoryFlush`                        | [Memory overview](/concepts/memory)                           |
+| Memory plugin selection         | `plugins.slots.memory`                                          | [Builtin](/concepts/memory-builtin), [Plugins](/tools/plugin) |
 
 ## Related
 
 - [Memory overview](/concepts/memory)
+- [Memory provenance and deletion](/concepts/memory-provenance)
 - [Dreaming](/concepts/dreaming)
 - [Active memory](/concepts/active-memory)
 - [User model](/concepts/user-model)

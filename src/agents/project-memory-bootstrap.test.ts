@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { MemorySearchResult } from "../memory-host-sdk/host/types.js";
 import {
   buildProjectMemoryWriteInstruction,
   filterProjectScopedCuratedContextFiles,
@@ -22,16 +23,22 @@ describe("project memory bootstrap", () => {
     runtimeMocks.search.mockReset();
   });
 
-  const entries = [
+  const entries: MemorySearchResult[] = [
     {
       path: "MEMORY.md",
       startLine: 2,
       endLine: 2,
       score: 0.8,
-      snippet: "Use the release helper. <!-- project: github.com/OpenClaw/OpenClaw -->",
+      snippet:
+        "Use the release helper. <!-- trigger: release helper --> <!-- importance: 8 --> <!-- project: github.com/OpenClaw/OpenClaw -->",
       source: "memory" as const,
       projectKey: "github.com/OpenClaw/OpenClaw",
       importance: 8,
+      provenance: {
+        originClass: "owner" as const,
+        sessionKind: "interactive" as const,
+        observedAt: 1,
+      },
     },
     {
       path: "MEMORY.md",
@@ -42,6 +49,11 @@ describe("project memory bootstrap", () => {
       source: "memory" as const,
       projectKey: "github.com/example/other",
       importance: 10,
+      provenance: {
+        originClass: "owner" as const,
+        sessionKind: "interactive" as const,
+        observedAt: 1,
+      },
     },
   ];
 
@@ -57,11 +69,40 @@ describe("project memory bootstrap", () => {
   }
 
   it("includes only active-project entries and stays inside its budget", async () => {
-    const lines = await prepareEntries(entries);
+    const lines = await prepareEntries([
+      ...entries,
+      {
+        ...entries[0]!,
+        startLine: 4,
+        snippet: "Untrusted project instruction.",
+        provenance: {
+          originClass: "untrusted",
+          sessionKind: "interactive",
+          observedAt: 1,
+        },
+      },
+      {
+        ...entries[0]!,
+        startLine: 5,
+        snippet: "Missing-provenance project instruction.",
+        provenance: undefined,
+      },
+    ]);
     const rendered = lines.join("\n");
     expect(rendered).toContain("Use the release helper.");
     expect(rendered).not.toContain("Foreign fact");
+    expect(rendered).not.toContain("Untrusted project instruction");
+    expect(rendered).not.toContain("Missing-provenance project instruction");
+    expect(rendered).not.toContain("<!--");
     expect(rendered.length).toBeLessThanOrEqual(2_000);
+  });
+
+  it("includes entries from every project retained in the session active set", async () => {
+    const rendered = (
+      await prepareEntries(entries, ["github.com/example/other", "github.com/OpenClaw/OpenClaw"])
+    ).join("\n");
+    expect(rendered).toContain("Use the release helper.");
+    expect(rendered).toContain("Foreign fact.");
   });
 
   it("never emits a partial entry or exceeds the hard budget", async () => {
@@ -83,6 +124,27 @@ describe("project memory bootstrap", () => {
     );
     expect(rendered).toContain("…");
     expect(rendered.length).toBeLessThanOrEqual(2_000);
+  });
+
+  it("admits a later exact-fit entry after skipping an oversized entry", async () => {
+    const first = Array.from({ length: 3 }, (_, index) => ({
+      ...entries[0]!,
+      startLine: index + 1,
+      snippet: "a".repeat(550),
+    }));
+    const prefix = await prepareEntries(first);
+    const sourceSuffix = " (Source: MEMORY.md#L5)";
+    const remaining = 2_000 - prefix.join("\n").length;
+    const lastSnippet = "z".repeat(remaining - "- ".length - sourceSuffix.length - 1);
+    const lines = await prepareEntries([
+      ...first,
+      { ...entries[0]!, startLine: 4, snippet: "b".repeat(600) },
+      { ...entries[0]!, startLine: 5, snippet: lastSnippet },
+      { ...entries[0]!, startLine: 6, snippet: "Does not fit." },
+    ]);
+
+    expect(lines).toEqual([...prefix.slice(0, -1), `- ${lastSnippet}${sourceSuffix}`, ""]);
+    expect(lines.join("\n")).toHaveLength(2_000);
   });
 
   it("keeps sessions without an active repository unchanged", async () => {

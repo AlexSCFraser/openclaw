@@ -1,4 +1,5 @@
 /** Pure repair rules for OpenClaw-generated plugin model catalogs. */
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 
 export const PLUGIN_MODEL_CATALOG_GENERATED_BY = "openclaw-plugin-model-catalog-v1";
 
@@ -7,15 +8,12 @@ type PluginModelCatalogRepair = {
   removedModelCount: number;
 };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function hasCatalogApi(value: unknown): boolean {
   return typeof value === "string" && value.length > 0;
 }
 
-function isGeneratedPluginModelCatalog(value: unknown): value is Record<string, unknown> {
+/** Detects the existing generated-catalog marker without admitting arrays or null. */
+export function isGeneratedPluginModelCatalog(value: unknown): value is Record<string, unknown> {
   return isRecord(value) && value.generatedBy === PLUGIN_MODEL_CATALOG_GENERATED_BY;
 }
 

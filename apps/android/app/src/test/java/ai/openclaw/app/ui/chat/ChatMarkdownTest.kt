@@ -123,6 +123,28 @@ class ChatMarkdownTest {
   }
 
   @Test
+  fun type6HtmlBlockCannotAbsorbTheDetailsCloser() {
+    val blocks =
+      parseChatMarkdownBlocks(
+        """
+        <details>
+        <summary>X</summary>
+
+        <div>body</div>
+        </details>
+
+        Following
+        """.trimIndent(),
+      )
+    val disclosure = blocks[0] as ChatMarkdownRenderBlock.Disclosure
+    val html = (disclosure.blocks.single() as ChatMarkdownRenderBlock.CommonMark).node as HtmlBlock
+    val following = (blocks[1] as ChatMarkdownRenderBlock.CommonMark).node as Paragraph
+
+    assertTrue(html.literal.contains("body"))
+    assertEquals("Following", (following.firstChild as org.commonmark.node.Text).literal)
+  }
+
+  @Test
   fun unsupportedNestedDetailsBalanceWithoutClosingOuterDisclosure() {
     val blocks =
       parseChatMarkdownBlocks(
@@ -471,6 +493,17 @@ class ChatMarkdownTest {
     // messages highlight regardless because CommonMark allows fences to end at EOF.
     assertNull(open.closingFenceLength)
     assertNotNull(closed.closingFenceLength)
+  }
+
+  @Test
+  fun mermaidOnlyClaimsExplicitCompletedFences() {
+    for ((language, diagram) in listOf("mermaid" to true, "MeRmAiD title" to true, "mermaid\ttitle" to true, "bash" to false, "mermaidjs" to false, "" to false)) {
+      val open = parseChatMarkdown("```$language\nflowchart LR\nA --> B\n").firstChild as FencedCodeBlock
+      val closed = parseChatMarkdown("```$language\nflowchart LR\nA --> B\n```\n").firstChild as FencedCodeBlock
+      assertEquals(false, isChatMermaidFence(open, isStreaming = true))
+      assertEquals(diagram, isChatMermaidFence(open, isStreaming = false))
+      assertEquals(diagram, isChatMermaidFence(closed, isStreaming = true))
+    }
   }
 
   @Test

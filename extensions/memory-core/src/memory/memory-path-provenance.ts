@@ -1,10 +1,12 @@
 // Memory Core plugin module classifies indexed workspace paths by provenance owner.
 import fs from "node:fs/promises";
 import path from "node:path";
+import { isPathStrictlyInside } from "openclaw/plugin-sdk/file-access-runtime";
 import type {
   MemoryEntryProvenance,
   MemorySource,
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+import { readMemoryArtifactProvenance } from "openclaw/plugin-sdk/memory-core-host-runtime-core";
 
 type MemoryPathClassification = {
   curatedRoot: boolean;
@@ -29,15 +31,10 @@ export async function resolveMemoryPathClassification(params: {
   } catch {
     return { curatedRoot: false, originClass: "untrusted" };
   }
-  const relativePath = path.relative(workspacePath, filePath);
-  if (
-    !relativePath ||
-    path.isAbsolute(relativePath) ||
-    relativePath === ".." ||
-    relativePath.startsWith(`..${path.sep}`)
-  ) {
+  if (!isPathStrictlyInside(workspacePath, filePath)) {
     return { curatedRoot: false, originClass: "untrusted" };
   }
+  const relativePath = path.relative(workspacePath, filePath);
   const segments = relativePath.split(path.sep);
   const curatedRoot =
     segments.length === 1 &&
@@ -50,6 +47,16 @@ export async function resolveMemoryPathClassification(params: {
   }
   const isWorkspaceMemory =
     curatedRoot || (segments[0] === "memory" && segments.at(-1)?.endsWith(".md") === true);
+  const normalizedRelativePath = relativePath.replaceAll(path.sep, "/");
+  const recorded = isWorkspaceMemory
+    ? await readMemoryArtifactProvenance({
+        workspaceDir: params.workspaceDir,
+        relativePath: normalizedRelativePath,
+      })
+    : undefined;
+  if (recorded) {
+    return { curatedRoot, originClass: recorded.originClass };
+  }
   // Workspace memory Markdown is owner-controlled. Flush-recorded provenance
   // still downgrades machine-written untrusted material during ingestion; the
   // index default must not fail closed the entire workspace.
