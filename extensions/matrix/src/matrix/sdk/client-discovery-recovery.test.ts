@@ -101,9 +101,11 @@ describe("Matrix startup with unavailable joined-room discovery", () => {
       await expect(
         client.sendMessage(missing, { msgtype: "m.text", body: "must not escape" }),
       ).rejects.toThrow("Encrypted Matrix room is not ready");
-      expect(fixture.fetch.mock.calls.some(([input]) => String(input).includes("/send/"))).toBe(
-        false,
-      );
+      expect(
+        fixture.fetch.mock.calls.some(([input]) =>
+          (input instanceof Request ? input.url : String(input)).includes("/send/"),
+        ),
+      ).toBe(false);
     },
   );
 
